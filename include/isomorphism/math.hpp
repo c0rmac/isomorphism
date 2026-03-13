@@ -196,6 +196,17 @@ namespace isomorphism::math {
      */
     Tensor atan2(const Tensor &y, const Tensor &x);
 
+    /** * @brief 1D Real Discrete Fourier Transform.
+     * Computes the FFT of a real-valued signal, exploiting Hermitian symmetry.
+     * Output shape for axis N is (N/2 + 1).
+     */
+    Tensor rfft(const Tensor &a, int n = -1, int axis = -1);
+
+    /** * @brief Inverse 1D Real Discrete Fourier Transform.
+     * Maps the frequency domain representation back to a real-valued time-domain signal.
+     */
+    Tensor irfft(const Tensor &a, int n = -1, int axis = -1);
+
     // ==============================================================================
     // 5. HEAVY LINEAR ALGEBRA
     // ==============================================================================

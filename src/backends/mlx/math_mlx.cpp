@@ -259,6 +259,26 @@ namespace isomorphism::math {
         return wrap(mlx::core::arctan2(unwrap(y), unwrap(x))); //
     }
 
+    Tensor rfft(const Tensor &a, int n, int axis) {
+        if (n == -1) {
+            // Calls the version: rfft(const array& a, int axis = -1, ...)
+            return wrap(mlx::core::fft::rfft(unwrap(a), axis));
+        } else {
+            // Calls the version: rfft(const array& a, int n, int axis, ...)
+            return wrap(mlx::core::fft::rfft(unwrap(a), n, axis));
+        }
+    }
+
+    Tensor irfft(const Tensor &a, int n, int axis) {
+        if (n == -1) {
+            // Calls the version: irfft(const array& a, int axis = -1, ...)
+            return wrap(mlx::core::fft::irfft(unwrap(a), axis));
+        } else {
+            // Calls the version: irfft(const array& a, int n, int axis, ...)
+            return wrap(mlx::core::fft::irfft(unwrap(a), n, axis));
+        }
+    }
+
     // ==============================================================================
     // 5. HEAVY LINEAR ALGEBRA
     // ==============================================================================
