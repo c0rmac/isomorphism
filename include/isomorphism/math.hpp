@@ -137,6 +137,11 @@ namespace isomorphism::math {
      */
     Tensor sum(const Tensor &a, const std::vector<int> &axes = {});
 
+    /** * @brief Computes the cumulative sum of elements along a given axis.
+     * For an input [x, y, z], returns [x, x+y, x+y+z].
+     */
+    Tensor cumsum(const Tensor &a, int axis = 0);
+
     /** @brief Returns the minimum element of the entire tensor as a scalar tensor. */
     Tensor min(const Tensor &a);
 

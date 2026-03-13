@@ -200,6 +200,11 @@ namespace isomorphism::math {
         return wrap(mlx::core::sum(unwrap(a), axes));
     }
 
+    Tensor cumsum(const Tensor &a, int axis) {
+        // MLX handles the scan operation efficiently on the active device.
+        return wrap(mlx::core::cumsum(unwrap(a), axis));
+    }
+
     Tensor min(const Tensor &a) {
         return wrap(mlx::core::min(unwrap(a)));
     }
