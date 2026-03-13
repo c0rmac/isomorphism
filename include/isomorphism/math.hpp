@@ -1,9 +1,9 @@
 /**
  * @file math.hpp
- * @brief Hardware-agnostic mathematical operations for Involute.
+ * @brief Hardware-agnostic mathematical operations for isomorphism.
  * * This namespace provides a Domain Specific Language (DSL) for batched tensor
  * operations. These functions act as a routing layer: they take opaque
- * involute::Tensor objects and translate the operation into highly optimized
+ * isomorphism::Tensor objects and translate the operation into highly optimized
  * native calls for the active backend (MLX on Apple, oneMKL/SYCL on PC).
  */
 
@@ -267,4 +267,4 @@ namespace isomorphism::math {
      * Essential for index-based operations like selecting the global best particle.
      */
     int to_int(const Tensor &a);
-} // namespace involute::math
+} // namespace isomorphism::math

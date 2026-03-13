@@ -9,12 +9,12 @@
 #include <iomanip>
 
 #include "tensor_impl_mlx.hpp"
-#include "involute/core/tensor.hpp"
+#include "isomorphism/tensor.hpp"
 #include <mlx/mlx.h>
 #include <vector>
 #include <ostream>
 
-namespace involute {
+namespace isomorphism {
 
 // ==============================================================================
 // TENSOR CLASS IMPLEMENTATION
@@ -131,4 +131,4 @@ std::ostream& operator<<(std::ostream& os, const Tensor& tensor) {
     return os;
 }
 
-} // namespace involute
+} // namespace isomorphism

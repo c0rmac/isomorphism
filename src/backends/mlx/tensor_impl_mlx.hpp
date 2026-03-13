@@ -1,16 +1,16 @@
-// Path: involute/src/backends/mlx/tensor_impl_mlx.hpp
+// Path: isomorphism/src/backends/mlx/tensor_impl_mlx.hpp
 #pragma once
 
-#include "involute/core/tensor.hpp"
+#include "isomorphism/tensor.hpp"
 #include <mlx/mlx.h>
 
 // ==============================================================================
 // THE PIMPL DEFINITION
 // ==============================================================================
 
-namespace involute {
+namespace isomorphism {
 
-    // Translates involute::DType to mlx::core::Dtype
+    // Translates isomorphism::DType to mlx::core::Dtype
     static inline mlx::core::Dtype get_mlx_dtype(DType dtype) {
         switch (dtype) {
             case DType::Float16:  return mlx::core::float16;
@@ -36,4 +36,4 @@ namespace involute {
         explicit TensorImpl(mlx::core::array arr) : data(std::move(arr)) {}
     };
 
-} // namespace involute
+} // namespace isomorphism

@@ -1,14 +1,14 @@
-// Path: involute/src/backends/mlx/math_mlx.cpp
+// Path: isomorphism/src/backends/mlx/math_mlx.cpp
 
 #include <iostream>
 
-#include "involute/core/math.hpp"
+#include "isomorphism/math.hpp"
 #include "tensor_impl_mlx.hpp" // Our private header
 #include <mlx/mlx.h>
 #include <thread>
 #include <vector>
 
-namespace involute::core::math {
+namespace isomorphism::math {
     // ==============================================================================
     // INTERNAL HELPERS (Pimpl Translation)
     // ==============================================================================
@@ -317,7 +317,7 @@ namespace involute::core::math {
         auto shape = arr.shape();
         int ndim = shape.size();
         if (ndim < 2) {
-            throw std::runtime_error("[Involute] det requires at least a 2D matrix.");
+            throw std::runtime_error("[isomorphism] det requires at least a 2D matrix.");
         }
         int d = shape.back();
 
@@ -522,4 +522,4 @@ namespace involute::core::math {
         // 4. Call MLX slice with the correct types
         return wrap(mlx::core::slice(arr, mlx_starts, mlx_stops, mlx_strides));
     }
-} // namespace involute
+} // namespace isomorphism

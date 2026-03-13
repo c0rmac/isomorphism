@@ -15,7 +15,7 @@
 #include <vector>
 #include <ostream>
 
-namespace involute {
+namespace isomorphism {
     /**
  * @enum DType
  * @brief Represents the data type of the underlying tensor memory.
@@ -36,7 +36,7 @@ namespace involute {
      * @brief Hardware-agnostic wrapper for multi-dimensional arrays.
      * * @example
      * // Creating a scalar tensor for math operations
-     * involute::Tensor beta_tensor(20.0);
+     * isomorphism::Tensor beta_tensor(20.0);
      * * // Introspecting a tensor returned from a solver
      * std::vector<int> s = my_tensor.shape();
      * std::cout << "Dimensions: " << my_tensor.ndim() << "\n";
@@ -104,7 +104,7 @@ namespace involute {
         }
 
         /** * @brief Accessor for the backend to retrieve the raw MLX/SYCL object.
-         * Used by functions inside `involute::math` to unwrap the tensor before math.
+         * Used by functions inside `isomorphism::math` to unwrap the tensor before math.
          */
         std::shared_ptr<TensorImpl> get_impl() const { return pimpl_; }
     };
@@ -113,4 +113,4 @@ namespace involute {
          * @brief Overload for standard output streams to print the underlying tensor data.
          */
     std::ostream &operator<<(std::ostream &os, const Tensor &tensor);
-} // namespace involute
+} // namespace isomorphism
