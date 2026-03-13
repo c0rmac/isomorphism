@@ -9,7 +9,7 @@
 
 #pragma once
 
-#include "involute/core/tensor.hpp"
+#include "isomorphism/tensor.hpp"
 #include <vector>
 #include <tuple>
 

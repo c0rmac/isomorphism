@@ -30,7 +30,7 @@ target_sources(isomorphism
         BASE_DIRS include
         FILES
         include/isomorphism/math.hpp
-        # include/isomorphism/tensor.hpp  <-- Add this when you create it
+        include/isomorphism/tensor.hpp
 )
 
 target_include_directories(isomorphism PUBLIC
