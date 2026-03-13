@@ -9,6 +9,27 @@
 #include <vector>
 
 namespace isomorphism::math {
+    // Internal state to track GPU FFT support
+    static bool g_fft_gpu_supported = true;
+    static std::once_flag g_fft_probe_flag;
+
+    static void probe_fft_support() {
+        std::call_once(g_fft_probe_flag, []() {
+            try {
+                // Perform a minimal 1D FFT on the default device (GPU)
+                auto probe_arr = mlx::core::zeros({8}, mlx::core::float32);
+                auto result = mlx::core::fft::rfft(probe_arr);
+
+                // Force evaluation to trigger the Metal/CUDA kernel
+                mlx::core::eval({result});
+                g_fft_gpu_supported = true;
+            } catch (const std::exception& e) {
+                // If it fails (e.g., "no CUDA implementation"), mark as unsupported
+                g_fft_gpu_supported = false;
+            }
+        });
+    }
+
     // ==============================================================================
     // INTERNAL HELPERS (Pimpl Translation)
     // ==============================================================================
@@ -260,22 +281,29 @@ namespace isomorphism::math {
     }
 
     Tensor rfft(const Tensor &a, int n, int axis) {
+        probe_fft_support();
+
+        // Select CPU explicitly if GPU implementation is missing
+        auto device = g_fft_gpu_supported ? mlx::core::default_device() : mlx::core::Device::cpu;
+        mlx::core::array arr = unwrap(a);
+
         if (n == -1) {
-            // Calls the version: rfft(const array& a, int axis = -1, ...)
-            return wrap(mlx::core::fft::rfft(unwrap(a), axis));
+            return wrap(mlx::core::fft::rfft(arr, axis, device));
         } else {
-            // Calls the version: rfft(const array& a, int n, int axis, ...)
-            return wrap(mlx::core::fft::rfft(unwrap(a), n, axis));
+            return wrap(mlx::core::fft::rfft(arr, n, axis, device));
         }
     }
 
     Tensor irfft(const Tensor &a, int n, int axis) {
+        probe_fft_support();
+
+        auto device = g_fft_gpu_supported ? mlx::core::default_device() : mlx::core::Device::cpu;
+        mlx::core::array arr = unwrap(a);
+
         if (n == -1) {
-            // Calls the version: irfft(const array& a, int axis = -1, ...)
-            return wrap(mlx::core::fft::irfft(unwrap(a), axis));
+            return wrap(mlx::core::fft::irfft(arr, axis, device));
         } else {
-            // Calls the version: irfft(const array& a, int n, int axis, ...)
-            return wrap(mlx::core::fft::irfft(unwrap(a), n, axis));
+            return wrap(mlx::core::fft::irfft(arr, n, axis, device));
         }
     }
 
