@@ -51,19 +51,20 @@ target_link_libraries(my_app PRIVATE isomorphism::isomorphism)
 ### Basic Usage
 ```cmake
 #include <isomorphism/math.hpp>
+#include <isomorphism/tensor.hpp>
 
-namespace iso = isomorphism::core::math;
+namespace iso = isomorphism;
 
 int main() {
     // Operations are automatically routed to the active backend (MLX or SYCL)
-    auto a = iso::full({3, 3}, 1.0f, DType::Float32);
-    auto b = iso::eye(3, DType::Float32);
+    iso::Tensor a = iso::math::full({3, 3}, 1.0f, DType::Float32);
+    iso::Tensor b = iso::math::eye(3, DType::Float32);
     
     // Perform a batched matrix multiplication
-    auto result = iso::matmul(a, b);
+    iso::Tensor result = iso::math::matmul(a, b);
     
     // Explicitly execute the computation graph
-    iso::eval(result);
+    iso::math::eval(result);
     
     return 0;
 }
