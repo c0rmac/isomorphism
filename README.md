@@ -2,19 +2,7 @@
 
 **Isomorphism** is a hardware-agnostic C++ tensor math library with a pluggable backend architecture. Write your mathematical logic once using a unified DSL and deploy it on any hardware — Apple Silicon, CPU, or GPU — by selecting a backend at compile time.
 
-The Pimpl pattern keeps the public API entirely decoupled from the backend. Swapping from MLX to PyTorch is a single CMake flag change, with zero modifications to application code.
-
----
-
-## Backends
-
-| Backend | Flag | Hardware | Dependency |
-|---|---|---|---|
-| **MLX** | `-DUSE_MLX=ON` | Apple Silicon (Metal/GPU) | [mlx](https://github.com/ml-explore/mlx) |
-| **Eigen** | `-DUSE_EIGEN=ON` | CPU (any platform) | [Eigen3](https://eigen.tuxfamily.org) |
-| **Torch** | `-DUSE_TORCH=ON` | CPU / CUDA / MPS | [LibTorch](https://pytorch.org) |
-
-Exactly one backend must be active per build.
+The Pimpl pattern keeps the public API entirely decoupled from the backend. Swapping from MLX to PyTorch is a single word change in `target_link_libraries`, with zero modifications to application code.
 
 ---
 
@@ -62,10 +50,35 @@ On macOS with Homebrew, `abseil` must also be installed (`brew install abseil`) 
 find_package(isomorphism REQUIRED)
 
 add_executable(my_app main.cpp)
-target_link_libraries(my_app PRIVATE isomorphism::isomorphism)
+target_link_libraries(my_app PRIVATE isomorphism::mlx)    # or ::eigen  or ::torch
 ```
 
-That's it. Include paths and backend linking are handled by the exported target.
+Each backend is a separate named target. Switching backend means changing one word:
+
+```cmake
+# Use Eigen on this machine
+target_link_libraries(my_app PRIVATE isomorphism::eigen)
+
+# Switch to Torch — no other changes needed
+target_link_libraries(my_app PRIVATE isomorphism::torch)
+```
+
+Multiple backends can be installed simultaneously and a single project can link different backends into different executables:
+
+```cmake
+target_link_libraries(fast_app    PRIVATE isomorphism::mlx)
+target_link_libraries(portable_app PRIVATE isomorphism::eigen)
+```
+
+**No backend flag is needed in your project's CMake.** The correct compile definition (`USE_MLX`, `USE_EIGEN`, `USE_TORCH`) is baked into each library at build time and propagated automatically to any target that links it.
+
+If you don't want to hard-code a backend name, use the `isomorphism_DEFAULT_TARGET` variable set by `find_package`:
+
+```cmake
+find_package(isomorphism REQUIRED)
+# isomorphism_DEFAULT_TARGET = whichever backend was compiled first (e.g. isomorphism::mlx)
+target_link_libraries(my_app PRIVATE ${isomorphism_DEFAULT_TARGET})
+```
 
 ---
 
@@ -182,6 +195,18 @@ int main() {
     return 0;
 }
 ```
+
+---
+
+## Backends
+
+| Backend | Flag | Hardware | Dependency |
+|---|---|---|---|
+| **MLX** | `-DUSE_MLX=ON` | Apple Silicon (Metal/GPU) | [mlx](https://github.com/ml-explore/mlx) |
+| **Eigen** | `-DUSE_EIGEN=ON` | CPU (any platform) | [Eigen3](https://eigen.tuxfamily.org) |
+| **Torch** | `-DUSE_TORCH=ON` | CPU / CUDA / MPS | [LibTorch](https://pytorch.org) |
+
+One or more backends can be built simultaneously. Each installs as its own library (`libisomorphism_mlx`, `libisomorphism_eigen`, `libisomorphism_torch`) and exports as a separate CMake target (`isomorphism::mlx`, `isomorphism::eigen`, `isomorphism::torch`).
 
 ---
 

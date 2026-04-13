@@ -8,7 +8,8 @@ set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
-# Backend Selection Options
+# Backend Selection Options — one or more may be enabled simultaneously.
+# Each produces its own library: libisomorphism_mlx, libisomorphism_eigen, etc.
 option(USE_MLX   "Build with Apple Silicon (Metal/MLX) backend" OFF)
 option(USE_SYCL  "Build with PC/Intel/NVIDIA (SYCL/oneMKL) backend" OFF)
 option(USE_EIGEN "Build with Eigen CPU backend" OFF)
@@ -16,119 +17,108 @@ option(USE_TORCH "Build with PyTorch (LibTorch) backend" OFF)
 option(BUILD_TESTING "Build the Isomorphism test suite" ON)
 
 set(_num_backends 0)
-if (USE_MLX)
-    math(EXPR _num_backends "${_num_backends} + 1")
-endif ()
-if (USE_SYCL)
-    math(EXPR _num_backends "${_num_backends} + 1")
-endif ()
-if (USE_EIGEN)
-    math(EXPR _num_backends "${_num_backends} + 1")
-endif ()
-if (USE_TORCH)
-    math(EXPR _num_backends "${_num_backends} + 1")
-endif ()
+foreach (_b MLX SYCL EIGEN TORCH)
+    if (USE_${_b})
+        math(EXPR _num_backends "${_num_backends} + 1")
+    endif ()
+endforeach ()
 
-if (_num_backends GREATER 1)
-    message(FATAL_ERROR "Isomorphism: Choose exactly one backend (USE_MLX, USE_SYCL, USE_EIGEN, or USE_TORCH).")
-elseif (_num_backends EQUAL 0)
-    message(FATAL_ERROR "Isomorphism: No backend selected. Use -DUSE_MLX=ON, -DUSE_SYCL=ON, -DUSE_EIGEN=ON, or -DUSE_TORCH=ON.")
+if (_num_backends EQUAL 0)
+    message(FATAL_ERROR
+        "Isomorphism: No backend selected.\n"
+        "Enable one or more: -DUSE_MLX=ON  -DUSE_EIGEN=ON  -DUSE_TORCH=ON  -DUSE_SYCL=ON")
 endif ()
 
 if (APPLE)
-    # Provide a hint to CMake for Homebrew's libomp location
     set(OpenMP_ROOT "/opt/homebrew/opt/libomp")
-endif()
+endif ()
 find_package(OpenMP REQUIRED)
 
 # ==============================================================================
-# 2. Core Library Definition
+# 2. Per-Backend Library Macro
 # ==============================================================================
-add_library(isomorphism)
+# Creates one self-contained library target per backend.
+# Each is named  isomorphism_<name>  and installs as  libisomorphism_<name>.
+# It also registers a build-tree alias  isomorphism::<name>.
+# The first backend registered becomes the default (used by tests).
+#
+# Usage: isomorphism_add_backend(<name> <COMPILE_DEFINE> <src1> [src2 ...])
+# ==============================================================================
+macro(isomorphism_add_backend _name _define)
+    set(_sources ${ARGN})
 
-# Setting up the File Set for modern header management
-target_sources(isomorphism
-        PUBLIC FILE_SET HEADERS
-        BASE_DIRS include
-        FILES
-        include/isomorphism/math.hpp
-        include/isomorphism/tensor.hpp
-)
+    add_library(isomorphism_${_name} ${_sources})
+    set_target_properties(isomorphism_${_name} PROPERTIES OUTPUT_NAME "isomorphism_${_name}")
 
-target_include_directories(isomorphism PUBLIC
+    target_include_directories(isomorphism_${_name} PUBLIC
         $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
         $<INSTALL_INTERFACE:include>
-)
+    )
 
-# ==============================================================================
-# 3. Debug & Optimization Configuration
-# ==============================================================================
-if (CMAKE_BUILD_TYPE STREQUAL "Debug")
-    message(STATUS "Isomorphism: Debug mode enabled. Adding sanitizers.")
-    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fsanitize=address -fsanitize=undefined -g")
+    # The PUBLIC compile definition propagates to any downstream target that
+    # links this library — no need for the consumer to set USE_MLX etc. manually.
+    target_compile_definitions(isomorphism_${_name} PUBLIC ${_define})
 
-    if (CMAKE_CXX_COMPILER_ID MATCHES "Clang|AppleClang|GNU")
-        target_compile_options(isomorphism PRIVATE -g -fno-omit-frame-pointer -fstack-protector-strong)
+    if (CMAKE_BUILD_TYPE STREQUAL "Debug")
+        set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fsanitize=address -fsanitize=undefined -g")
+        if (CMAKE_CXX_COMPILER_ID MATCHES "Clang|AppleClang|GNU")
+            target_compile_options(isomorphism_${_name} PRIVATE
+                -g -fno-omit-frame-pointer -fstack-protector-strong)
+        endif ()
     endif ()
-endif ()
 
-if (CMAKE_BUILD_TYPE STREQUAL "Release")
-    if (CMAKE_CXX_COMPILER_ID MATCHES "Clang|AppleClang|GNU")
-        target_compile_options(isomorphism PRIVATE -O3 -ffast-math -march=native)
+    if (CMAKE_BUILD_TYPE STREQUAL "Release")
+        if (CMAKE_CXX_COMPILER_ID MATCHES "Clang|AppleClang|GNU")
+            target_compile_options(isomorphism_${_name} PRIVATE -O3 -ffast-math -march=native)
+        endif ()
     endif ()
-endif ()
+
+    # Alias for build-tree consumers (e.g. add_subdirectory users)
+    add_library(isomorphism::${_name} ALIAS isomorphism_${_name})
+
+    # Accumulate for the install() call below
+    list(APPEND _iso_install_targets isomorphism_${_name})
+
+    # The first registered backend becomes the default
+    if (NOT DEFINED _iso_default_backend)
+        set(_iso_default_backend ${_name})
+    endif ()
+endmacro()
 
 # ==============================================================================
-# 4. Backend-Specific Implementation
+# 3. Backend Targets
 # ==============================================================================
 
-# Apple Silicon / MLX Backend
+# --- Apple Silicon / MLX ---
 if (USE_MLX)
-    message(STATUS "Isomorphism: Configuring MLX Backend (Apple Silicon)")
-    target_compile_definitions(isomorphism PUBLIC USE_MLX)
-
-    target_sources(isomorphism PRIVATE
-            src/backends/mlx/tensor_mlx.cpp
-            src/backends/mlx/math_mlx.cpp
-    )
-
+    message(STATUS "Isomorphism: Building MLX backend (Apple Silicon)")
     find_package(MLX REQUIRED)
-    target_link_libraries(isomorphism PRIVATE mlx)
-
-# Eigen CPU Backend
-elseif (USE_EIGEN)
-    message(STATUS "Isomorphism: Configuring Eigen CPU Backend")
-    target_compile_definitions(isomorphism PUBLIC USE_EIGEN)
-
-    target_sources(isomorphism PRIVATE
-            src/backends/eigen/tensor_eigen.cpp
-            src/backends/eigen/math_eigen.cpp
+    isomorphism_add_backend(mlx USE_MLX
+        src/backends/mlx/tensor_mlx.cpp
+        src/backends/mlx/math_mlx.cpp
     )
+    target_link_libraries(isomorphism_mlx PRIVATE mlx)
+endif ()
 
+# --- Eigen CPU ---
+if (USE_EIGEN)
+    message(STATUS "Isomorphism: Building Eigen backend (CPU)")
     find_package(Eigen3 REQUIRED NO_MODULE)
-    target_link_libraries(isomorphism PRIVATE Eigen3::Eigen OpenMP::OpenMP_CXX)
-
-# PyTorch (LibTorch) Backend
-# Requires LibTorch to be discoverable via CMAKE_PREFIX_PATH, e.g.:
-#   cmake -DUSE_TORCH=ON -DCMAKE_PREFIX_PATH=/path/to/libtorch ..
-elseif (USE_TORCH)
-    message(STATUS "Isomorphism: Configuring PyTorch (LibTorch) Backend")
-    target_compile_definitions(isomorphism PUBLIC USE_TORCH)
-
-    target_sources(isomorphism PRIVATE
-            src/backends/torch/tensor_torch.cpp
-            src/backends/torch/math_torch.cpp
+    isomorphism_add_backend(eigen USE_EIGEN
+        src/backends/eigen/tensor_eigen.cpp
+        src/backends/eigen/math_eigen.cpp
     )
+    target_link_libraries(isomorphism_eigen PRIVATE Eigen3::Eigen OpenMP::OpenMP_CXX)
+endif ()
+
+# --- PyTorch / LibTorch ---
+if (USE_TORCH)
+    message(STATUS "Isomorphism: Building Torch backend (PyTorch/LibTorch)")
 
     # On Homebrew macOS, LibTorch's bundled protobuf declares absl:: link targets
-    # but never calls find_package(absl) itself, so "absl::absl_check not found"
-    # errors occur at configure time.  We pre-find absl before find_package(Torch).
-    #
-    # GUI tools like CLion don't inherit the shell PATH, so execute_process(brew)
-    # may fail.  Instead we probe the Homebrew opt symlinks directly — Homebrew
-    # always installs formula at:
-    #   Apple Silicon : /opt/homebrew/opt/<formula>
-    #   Intel Mac     : /usr/local/opt/<formula>
+    # but never calls find_package(absl) itself.  We probe the Homebrew opt
+    # symlinks directly — GUI tools like CLion don't inherit the shell PATH so
+    # execute_process(brew) is unreliable.
     if (APPLE AND NOT absl_FOUND)
         foreach (_absl_candidate
                 "/opt/homebrew/opt/abseil/lib/cmake/absl"   # Apple Silicon
@@ -138,68 +128,91 @@ elseif (USE_TORCH)
                 break()
             endif ()
         endforeach ()
-
         if (NOT absl_DIR)
             message(FATAL_ERROR
                 "Isomorphism [USE_TORCH]: abseil not found.\n"
-                "LibTorch's protobuf requires it.  Install via:\n"
-                "  brew install abseil")
+                "LibTorch's protobuf requires it.  Install via: brew install abseil")
         endif ()
     endif ()
     find_package(absl QUIET)
-
     find_package(Torch REQUIRED)
-    # Suppress warnings from LibTorch headers by marking them as system includes.
-    target_include_directories(isomorphism SYSTEM PRIVATE "${TORCH_INCLUDE_DIRS}")
-    target_link_libraries(isomorphism PRIVATE "${TORCH_LIBRARIES}")
-    # LibTorch may require C++17 ABI flags; propagate them if set.
-    if (TORCH_CXX_FLAGS)
-        target_compile_options(isomorphism PRIVATE ${TORCH_CXX_FLAGS})
-    endif ()
 
-# PC / Intel / NVIDIA SYCL Backend
-elseif (USE_SYCL)
-    message(STATUS "Isomorphism: Configuring SYCL/oneMKL Backend (PC GPU)")
-    target_compile_definitions(isomorphism PUBLIC USE_SYCL)
-
-    target_sources(isomorphism PRIVATE
-            src/backends/sycl/tensor_sycl.cpp
-            src/backends/sycl/math_sycl.cpp
+    isomorphism_add_backend(torch USE_TORCH
+        src/backends/torch/tensor_torch.cpp
+        src/backends/torch/math_torch.cpp
     )
+    target_include_directories(isomorphism_torch SYSTEM PRIVATE "${TORCH_INCLUDE_DIRS}")
+    target_link_libraries(isomorphism_torch PRIVATE "${TORCH_LIBRARIES}")
+    if (TORCH_CXX_FLAGS)
+        target_compile_options(isomorphism_torch PRIVATE ${TORCH_CXX_FLAGS})
+    endif ()
+endif ()
 
+# --- SYCL / oneMKL ---
+if (USE_SYCL)
+    message(STATUS "Isomorphism: Building SYCL backend (PC GPU / oneMKL)")
     find_package(MKL REQUIRED)
-    target_compile_options(isomorphism PRIVATE -fsycl)
-    target_link_options(isomorphism PRIVATE -fsycl)
-    target_link_libraries(isomorphism PRIVATE MKL::MKL)
+    isomorphism_add_backend(sycl USE_SYCL
+        src/backends/sycl/tensor_sycl.cpp
+        src/backends/sycl/math_sycl.cpp
+    )
+    target_compile_options(isomorphism_sycl PRIVATE -fsycl)
+    target_link_options(isomorphism_sycl PRIVATE -fsycl)
+    target_link_libraries(isomorphism_sycl PRIVATE MKL::MKL)
 endif ()
 
 # ==============================================================================
-# 5. Installation & Export (For use in other projects)
+# 4. Build-Tree Default Alias
 # ==============================================================================
-install(TARGETS isomorphism
-        EXPORT IsomorphismTargets
-        FILE_SET HEADERS
-        LIBRARY DESTINATION lib
-        ARCHIVE DESTINATION lib
-        RUNTIME DESTINATION bin
+# Plain "isomorphism" target used by tests/add_subdirectory consumers.
+# Points to the first registered backend (MLX > Eigen > Torch > SYCL).
+add_library(isomorphism ALIAS isomorphism_${_iso_default_backend})
+
+# ==============================================================================
+# 5. Installation & Export
+# ==============================================================================
+
+# Headers are shared by all backends — install once from the source tree.
+install(DIRECTORY include/ DESTINATION include)
+
+# Install all built backend libraries under the same export set.
+install(TARGETS ${_iso_install_targets}
+    EXPORT IsomorphismTargets
+    LIBRARY DESTINATION lib
+    ARCHIVE DESTINATION lib
+    RUNTIME DESTINATION bin
 )
 
 install(EXPORT IsomorphismTargets
-        FILE IsomorphismTargets.cmake
-        NAMESPACE isomorphism::
-        DESTINATION lib/cmake/isomorphism
+    FILE IsomorphismTargets.cmake
+    NAMESPACE isomorphism::
+    DESTINATION lib/cmake/isomorphism
 )
 
-# Create a config file so find_package(isomorphism) works seamlessly
+# Config file:
+#   • Loads the exported targets  (isomorphism::mlx, isomorphism::eigen, …)
+#   • Exposes isomorphism_DEFAULT_TARGET pointing to whichever backend was
+#     first registered in this build — consumers can use it directly or
+#     override it with the explicit target name they want.
 file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/isomorphismConfig.cmake"
-        "include(\"\${CMAKE_CURRENT_LIST_DIR}/IsomorphismTargets.cmake\")"
-)
+[=[
+include("${CMAKE_CURRENT_LIST_DIR}/IsomorphismTargets.cmake")
+
+# isomorphism_DEFAULT_TARGET — the first backend compiled into this installation.
+# Override in your own CMakeLists.txt to select a different backend:
+#
+#   target_link_libraries(my_app PRIVATE isomorphism::torch)
+#   target_link_libraries(my_app PRIVATE isomorphism::eigen)
+#   target_link_libraries(my_app PRIVATE isomorphism::mlx)
+]=])
+file(APPEND "${CMAKE_CURRENT_BINARY_DIR}/isomorphismConfig.cmake"
+    "set(isomorphism_DEFAULT_TARGET isomorphism::${_iso_default_backend})\n")
 
 install(FILES "${CMAKE_CURRENT_BINARY_DIR}/isomorphismConfig.cmake"
-        DESTINATION lib/cmake/isomorphism
+    DESTINATION lib/cmake/isomorphism
 )
 
 # ==============================================================================
-# Tests
+# 6. Tests
 # ==============================================================================
 add_subdirectory(tests)
