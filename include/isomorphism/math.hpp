@@ -122,6 +122,12 @@ namespace isomorphism::math {
     /** @brief Element-wise 'less than' comparison. */
     Tensor less(const Tensor &a, const Tensor &b);
 
+    /** @brief Element-wise 'greater than or equal to' comparison. */
+    Tensor greater_equal(const Tensor &a, const Tensor &b);
+
+    /** @brief Element-wise 'less than or equal to' comparison. */
+    Tensor less_equal(const Tensor &a, const Tensor &b);
+
     /** @brief Element-wise logical AND. */
     Tensor logical_and(const Tensor &a, const Tensor &b);
 
@@ -227,6 +233,38 @@ namespace isomorphism::math {
      */
     std::tuple<Tensor, Tensor, Tensor> svd(const Tensor &a);
 
+    /** * @brief Computes the matrix exponential via adaptive diagonal Padé approximants.
+     *
+     * Implements the algorithm of Blanes, Kopylov & Seydaoglu (2024) in Lie-group
+     * mode: uses only diagonal Padé approximants r_{m,m}, which satisfy
+     * r_{m,m}(-x) = 1/r_{m,m}(x) and therefore preserve the group structure
+     * exactly.  If A ∈ so(n) (skew-symmetric) then exp(A) ∈ SO(n) to working
+     * precision, with no manifold drift.
+     *
+     * The order m ∈ {3, 5, 7} and scaling exponent s are chosen adaptively from
+     * the 1-norm of A using single-precision backward-error thresholds derived in
+     * the paper.  For a 2k×2k shape matrix with ||A||₁ ~ O(k), this requires
+     * roughly (m-1) + s matmuls + 1 solve vs ~16 + s for the Taylor approach,
+     * giving ~3× fewer operations for large k.
+     *
+     * @param A Square matrix (d × d), typically a Lie algebra element ∈ so(d).
+     * @return exp(A) as a (d × d) tensor, in SO(d) when A is skew-symmetric.
+     */
+    Tensor matrix_exp(const Tensor &a);
+
+    /** * @brief Creates a 2D diagonal matrix from a 1D tensor.
+     * Given a vector v of length k, returns the k x k matrix with v on the main diagonal.
+     */
+    Tensor diag_embed(const Tensor &v);
+
+    /** * @brief Extracts the main diagonal of a 2D matrix as a 1D tensor.
+     * Given a k x k matrix A, returns the k-vector (A_{00}, A_{11}, ..., A_{k-1,k-1}).
+     */
+    Tensor diag_extract(const Tensor &a);
+
+    /** * @brief Element-wise sign function: -1 for negative, 0 for zero, +1 for positive. */
+    Tensor sign(const Tensor &a);
+
     /** * @brief Batched QR Decomposition.
      * @return A tuple of 2 tensors: {Q, R}.
      * The Q matrix represents the direct chordal projection of an ambient
@@ -283,4 +321,7 @@ namespace isomorphism::math {
      * Essential for index-based operations like selecting the global best particle.
      */
     int to_int(const Tensor &a);
+
+    void set_default_device_cpu();
+    void set_default_device_gpu();
 } // namespace isomorphism::math

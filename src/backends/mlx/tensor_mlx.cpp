@@ -7,55 +7,93 @@
  */
 
 #include <iomanip>
+#include <vector>
+#include <ostream>
 
 #include "tensor_impl_mlx.hpp"
 #include "isomorphism/tensor.hpp"
 #include <mlx/mlx.h>
-#include <vector>
-#include <ostream>
 
 namespace isomorphism {
+
+// ==============================================================================
+// INTERNAL UTILITIES
+// ==============================================================================
+
+/**
+ * @brief Helper to map our DType enum to MLX's internal type system.
+ * By defining this locally, we avoid any dependency on the math namespace.
+ */
+static mlx::core::Dtype to_mlx_dtype(DType dtype) {
+    switch (dtype) {
+        case DType::Float16:  return mlx::core::float16;
+        case DType::BFloat16: return mlx::core::bfloat16;
+        case DType::Float32:
+        default:              return mlx::core::float32;
+    }
+}
 
 // ==============================================================================
 // TENSOR CLASS IMPLEMENTATION
 // ==============================================================================
 
-// Default constructor: Initializes an empty/zero scalar tensor
-Tensor::Tensor() : pimpl_(std::make_shared<TensorImpl>()) {}
+/** @brief Default constructor: Initializes an empty/null tensor.
+ * Initializes pimpl_ to nullptr to represent an uninitialized state.
+ */
+Tensor::Tensor() : pimpl_(nullptr), dtype_(DType::Float32) {}
 
-// Scalar constructor: Initializes a 0D array with a specific double value.
-// Crucial for broadcasting, like when we do `math::multiply(X, Tensor(0.5))`
-    Tensor::Tensor(double scalar_value, DType dtype) {
-    mlx::core::Dtype mlx_type = get_mlx_dtype(dtype);
-    pimpl_ = std::make_shared<TensorImpl>(mlx::core::array(scalar_value, mlx_type));
-    dtype_ = dtype;
+/** * @brief Scalar constructor: Initializes a 0D array with a specific double value.
+ * Crucial for broadcasting, like when we do `math::multiply(X, Tensor(0.5))`.
+ */
+Tensor::Tensor(double scalar_value, DType dtype) : dtype_(dtype) {
+    // Map our DType to MLX's internal type system via our local helper
+    mlx::core::Dtype mlx_type = to_mlx_dtype(dtype);
+    // Create the MLX array and wrap it in the Pimpl container
+    pimpl_ = std::make_shared<TensorImpl>(mlx::core::array(static_cast<float>(scalar_value), mlx_type));
 }
 
-// Destructor: We must explicitly default it here in the .cpp file where
-// TensorImpl is fully defined, otherwise the compiler complains about
-// destroying an incomplete type.
+/**
+ * @brief Unified backend constructor.
+ * Required by math_mlx.cpp to wrap native MLX arrays into our public Tensor handle.
+ * This resolves the "Undefined symbols" linker error.
+ */
+Tensor::Tensor(std::shared_ptr<TensorImpl> pimpl, DType dtype)
+    : pimpl_(std::move(pimpl)), dtype_(dtype) {}
+
+/** * @brief Destructor: Explicitly defaulted here where TensorImpl is fully defined.
+ * The shared_ptr handles the actual memory cleanup.
+ */
 Tensor::~Tensor() = default;
+
 
 // ==============================================================================
 // INTROSPECTION METHODS
 // ==============================================================================
 
-    std::vector<int> Tensor::shape() const {
-        // MLX returns a custom 'SmallVector<int>', so we explicitly
-        // construct a standard std::vector<int> from its iterators.
-        const auto& s = pimpl_->data.shape();
-        return std::vector<int>(s.begin(), s.end());
-    }
+std::vector<int> Tensor::shape() const {
+    if (!pimpl_) return {};
+    // MLX returns a custom 'SmallVector<int>', so we explicitly
+    // construct a standard std::vector<int> from its iterators.
+    const auto& s = pimpl_->data.shape();
+    return std::vector<int>(s.begin(), s.end());
+}
 
 int Tensor::ndim() const {
+    if (!pimpl_) return 0;
     return pimpl_->data.ndim();
 }
 
 int Tensor::size() const {
+    if (!pimpl_) return 0;
     return pimpl_->data.size();
 }
 
-    /**
+
+// ==============================================================================
+// PRINTING & FORMATTING (N-Dimensional Traversal)
+// ==============================================================================
+
+/**
  * @brief Recursively prints N-dimensional tensor data with appropriate bracket nesting.
  */
 static void print_recursive(std::ostream& os, const float* data, const std::vector<int>& shape,
@@ -67,7 +105,7 @@ static void print_recursive(std::ostream& os, const float* data, const std::vect
     }
 
     // Base case 2: Innermost dimension (Print actual values)
-    if (depth == shape.size() - 1) {
+    if (depth == static_cast<int>(shape.size()) - 1) {
         os << "[";
         for (int i = 0; i < shape[depth]; ++i) {
             os << std::setprecision(6) << data[offset + i * strides[depth]];
@@ -90,23 +128,22 @@ static void print_recursive(std::ostream& os, const float* data, const std::vect
     }
 }
 
-// ==============================================================================
-// STREAM OUTPUT OPERATOR
-// ==============================================================================
-
+/**
+ * @brief Overload for standard output streams to print the underlying tensor data.
+ */
 std::ostream& operator<<(std::ostream& os, const Tensor& tensor) {
-    auto impl = tensor.get_impl(); //
+    auto impl = tensor.get_impl();
     if (!impl) {
-        return os << "[Null Tensor]";
+        return os << "Tensor(Null)";
     }
 
-    // 1. Force the MLX backend to execute pending operations
+    // 1. Force the MLX backend to execute pending operations in the compute graph
     mlx::core::eval({impl->data});
 
     // 2. Extract shape
     auto shape = tensor.shape();
 
-    // 3. Compute flat memory strides (assuming contiguous C-style memory)
+    // 3. Compute flat memory strides (assuming contiguous C-style memory for printing)
     std::vector<size_t> strides(shape.size(), 1);
     if (!shape.empty()) {
         for (int i = static_cast<int>(shape.size()) - 2; i >= 0; --i) {
@@ -114,13 +151,13 @@ std::ostream& operator<<(std::ostream& os, const Tensor& tensor) {
         }
     }
 
-    // 4. Safely grab the raw float pointer
+    // 4. Safely grab the raw float pointer from the MLX array
     const float* ptr = impl->data.data<float>();
 
     // 5. Print the header
     os << "Tensor(shape={";
     for (size_t i = 0; i < shape.size(); ++i) {
-        os << shape[i] << (i == shape.size() - 1 ? "" : ", ");
+        os << shape[i] << (i == static_cast<size_t>(shape.size()) - 1 ? "" : ", ");
     }
     os << "}, data=\n";
 

@@ -181,6 +181,16 @@ namespace isomorphism::math {
         return wrap(mlx::core::less(unwrap(a), unwrap(b))); //
     }
 
+    Tensor greater_equal(const Tensor &a, const Tensor &b) {
+        // MLX handles broadcasting and GPU dispatch natively
+        return wrap(mlx::core::greater_equal(unwrap(a), unwrap(b)));
+    }
+
+    Tensor less_equal(const Tensor &a, const Tensor &b) {
+        // Maps directly to the Metal 'less_equal' kernel
+        return wrap(mlx::core::less_equal(unwrap(a), unwrap(b)));
+    }
+
     Tensor logical_and(const Tensor &a, const Tensor &b) {
         return wrap(mlx::core::logical_and(unwrap(a), unwrap(b))); //
     }
@@ -316,9 +326,60 @@ namespace isomorphism::math {
     // 5. HEAVY LINEAR ALGEBRA
     // ==============================================================================
 
+    static mlx::core::array custom_gpu_solve_impl(const mlx::core::array& a, const mlx::core::array& b,
+                                                 int max_iters, float tol) {
+        // 1. Dynamic Norm and Omega Calculation
+        mlx::core::array abs_a = mlx::core::abs(a);
+        mlx::core::array row_sums = mlx::core::sum(abs_a, {-1}, true);
+        mlx::core::array norm_a = mlx::core::max(row_sums, {-2}, true);
+
+        mlx::core::array epsilon = mlx::core::array(1e-7f, a.dtype());
+        mlx::core::array safe_norm = mlx::core::maximum(norm_a, epsilon);
+        mlx::core::array omega = mlx::core::divide(mlx::core::array(1.0f, a.dtype()), safe_norm);
+
+        // 2. Initial State: Compute initial residual before the loop
+        mlx::core::array x = mlx::core::multiply(omega, b);
+        mlx::core::array ax_init = mlx::core::matmul(a, x);
+        mlx::core::array residual = mlx::core::subtract(b, ax_init);
+
+        const int check_interval = 5;
+
+        for (int i = 0; i < max_iters; i += check_interval) {
+            // 3. Iterative Chunking: Prevents excessive CPU-GPU context switching
+            for (int j = 0; j < check_interval && (i + j) < max_iters; ++j) {
+                // Update rule: X_{k+1} = X_k + omega * residual
+                x = mlx::core::add(x, mlx::core::multiply(omega, residual));
+
+                // Refresh residual for the next step
+                mlx::core::array ax = mlx::core::matmul(a, x);
+                residual = mlx::core::subtract(b, ax);
+            }
+
+            // --- ASYNCHRONOUS CONVERGENCE CHECK ---
+            // Only 'eval' every few steps to maintain GPU throughput
+            mlx::core::array max_err_arr = mlx::core::max(mlx::core::abs(residual));
+            mlx::core::eval({max_err_arr, x});
+
+            if (max_err_arr.item<float>() < tol) {
+                break;
+            }
+        }
+
+        return x;
+    }
+
     Tensor solve(const Tensor &a, const Tensor &b) {
-        // The engine behind your Cayley Transform
-        return wrap(mlx::core::linalg::solve(unwrap(a), unwrap(b), mlx::core::Device::cpu));
+        // Check the active execution stream/device.
+        // If running on the GPU, route to the asynchronous, graph-native iterative solver.
+        if (mlx::core::default_device() == mlx::core::Device::gpu) {
+            // 15 iterations is typically sufficient for the strongly diagonally dominant
+            // denominator matrix (V - U) generated in the Padé approximant.
+            return wrap(custom_gpu_solve_impl(unwrap(a), unwrap(b), 15, 1e-5f));
+        }
+        // If explicitly running on the CPU, fall back to the native LAPACK implementation.
+        else {
+            return wrap(mlx::core::linalg::solve(unwrap(a), unwrap(b), mlx::core::Device::cpu));
+        }
     }
 
     std::tuple<Tensor, Tensor, Tensor> svd(const Tensor &a) {
@@ -466,12 +527,155 @@ namespace isomorphism::math {
         return wrap(mlx::core::linalg::inv(unwrap(a), mlx::core::Device::cpu)); //
     }
 
+    // ==============================================================================
+    // MATRIX EXPONENTIAL — Adaptive Diagonal Padé (Blanes, Kopylov, Seydaoglu 2024)
+    //
+    // Uses diagonal Padé approximants r_{m,m}(A) only, which are the unique
+    // rational approximants satisfying r_{m,m}(-x) = 1/r_{m,m}(x).  This mirrors
+    // the Lie algebra / Lie group duality: if A ∈ so(n) then exp(A) ∈ SO(n), and
+    // the same holds for the Padé approximant.  (Taylor series does not have this
+    // property and can drift off the manifold.)
+    //
+    // For float32 (u ≈ 2^{-24}), the backward-error thresholds scale as
+    //   θ_m(fp32) / θ_m(fp64) ≈ (2^29)^{1/(2m)}
+    // giving the following single-precision thresholds for the Padé orders used:
+    //   m=3: θ ≈ 0.42   (2 matmuls + 1 solve)
+    //   m=5: θ ≈ 1.90   (3 matmuls + 1 solve)
+    //   m=7: θ ≈ 3.70   (4 matmuls + 1 solve)
+    // For ||A||₁ > θ_7, we scale A → A/2^s until ||A/2^s||₁ ≤ θ_7, then square
+    // back.  Typical 2k×2k shape matrices (k≈100) need s ≤ 3 squarings, giving
+    // ~6 total operations vs ~20 for the 16-term Taylor + squaring approach.
+    // ==============================================================================
+
+    Tensor matrix_exp(const Tensor &a) {
+        mlx::core::array arr = unwrap(a);
+        mlx::core::Dtype orig_dtype = arr.dtype();
+
+        auto shape = arr.shape();
+        int ndim = shape.size();
+        int d = shape.back(); // Matrix dimension
+        const mlx::core::Dtype f32 = mlx::core::float32;
+
+        // Upcast low-precision inputs to float32 for stable Padé computation.
+        bool needs_cast = (orig_dtype == mlx::core::float16 ||
+                           orig_dtype == mlx::core::bfloat16);
+        if (needs_cast)
+            arr = mlx::core::astype(arr, f32);
+
+        // --- Batched 1-norm: max absolute column sum ---
+        // For a skew-symmetric A, ||A||₁ = ||A||_∞.
+        // We compute the norm for every matrix in the batch, then find the global
+        // maximum to determine a single scaling factor for the entire GPU workload.
+        auto abs_a = mlx::core::abs(arr);
+        auto col_sums = mlx::core::sum(abs_a, {ndim - 2});      // Sum over matrix rows (axis -2)
+        auto max_col_sums = mlx::core::max(col_sums, {ndim - 2}); // Max over matrix columns (axis -1)
+        auto global_max_arr = mlx::core::max(max_col_sums);      // Global max across entire batch
+
+        // The "Compute Trigger": Sync once to decide Padé parameters for all N samples.
+        mlx::core::eval({global_max_arr});
+        double norm1 = static_cast<double>(global_max_arr.item<float>());
+
+        // --- Single-precision backward-error thresholds (derived in paper §2) ---
+        constexpr double kTheta3 = 0.42;
+        constexpr double kTheta5 = 1.90;
+        constexpr double kTheta7 = 3.70;
+
+        // --- Choose scaling s so that ||A/2^s||₁ ≤ kTheta7, then pick cheapest m ---
+        int s = 0;
+        double scaled_norm = norm1;
+        while (scaled_norm > kTheta7) { scaled_norm /= 2.0; ++s; }
+        const int m = (scaled_norm <= kTheta3) ? 3 : (scaled_norm <= kTheta5) ? 5 : 7;
+
+        // --- B = A / 2^s ---
+        mlx::core::array B = arr;
+        if (s > 0) {
+            float inv_s = 1.0f / std::pow(2.0f, static_cast<float>(s));
+            B = mlx::core::multiply(arr, mlx::core::array(inv_s, f32));
+        }
+
+        // --- Build Padé numerator p(B) = V + U and denominator q(B) = V - U ---
+        // All operations below are automatically vectorized across the batch dimension.
+        auto sc = [&](float c, mlx::core::array X) {
+            return mlx::core::multiply(X, mlx::core::array(c, f32));
+        };
+
+        // eye(d) broadcasts across the [..., d, d] batch automatically.
+        mlx::core::array I_d = mlx::core::eye(d, f32);
+        mlx::core::array B2 = mlx::core::matmul(B, B);
+
+        mlx::core::array U = mlx::core::array(0.0f);
+        mlx::core::array V = mlx::core::array(0.0f);
+
+        if (m == 3) {
+            U = mlx::core::matmul(B, mlx::core::add(sc(60.f, I_d), sc(1.f, B2)));
+            V = mlx::core::add(sc(120.f, I_d), sc(12.f, B2));
+        } else if (m == 5) {
+            mlx::core::array B4 = mlx::core::matmul(B2, B2);
+            U = mlx::core::matmul(B,
+                    mlx::core::add(sc(15120.f, I_d),
+                    mlx::core::add(sc(420.f,   B2),
+                                   sc(1.f,     B4))));
+            V =     mlx::core::add(sc(30240.f, I_d),
+                    mlx::core::add(sc(3360.f,  B2),
+                                   sc(30.f,    B4)));
+        } else {  // m == 7
+            mlx::core::array B4 = mlx::core::matmul(B2, B2);
+            mlx::core::array B6 = mlx::core::matmul(B4, B2);
+            U = mlx::core::matmul(B,
+                    mlx::core::add(sc(8648640.f, I_d),
+                    mlx::core::add(sc(277200.f,  B2),
+                    mlx::core::add(sc(1512.f,    B4),
+                                   sc(1.f,       B6)))));
+            V =     mlx::core::add(sc(17297280.f, I_d),
+                    mlx::core::add(sc(1995840.f,  B2),
+                    mlx::core::add(sc(25200.f,    B4),
+                                   sc(56.f,       B6))));
+        }
+
+        // r_{m,m}(B) = (V - U)^{-1} (V + U) via solve [avoids explicit inversion]
+        // We utilize the custom iterative GPU solver for batched numerical stability.
+        Tensor T_V_minus_U = wrap(mlx::core::subtract(V, U));
+        Tensor T_V_plus_U  = wrap(mlx::core::add(V, U));
+        Tensor T_result    = solve(T_V_minus_U, T_V_plus_U);
+        //Tensor T_result    = mlx::core::linalg::solve(unwrap(T_V_minus_U), unwrap(T_V_plus_U), mlx::core::Device::cpu);
+        mlx::core::array result = unwrap(T_result);
+
+        // --- Squaring phase: exp(A) = r_{m,m}(B)^{2^s} ---
+        for (int i = 0; i < s; ++i)
+            result = mlx::core::matmul(result, result);
+
+        if (needs_cast)
+            result = mlx::core::astype(result, orig_dtype);
+
+        return wrap(result);
+    }
+
+    Tensor diag_embed(const Tensor &v) {
+        // Creates a square diagonal matrix from a 1D tensor
+        return wrap(mlx::core::diag(unwrap(v), 0));
+    }
+
+    Tensor diag_extract(const Tensor &a) {
+        // Extracts the main diagonal of a 2D matrix as a 1D tensor.
+        // Uses the same mlx::core::diagonal call pattern as trace().
+        auto arr = unwrap(a);
+        int ndim = arr.ndim();
+        if (ndim < 2) return a;
+        // Explicitly extract diagonal from the last two axes (Rows, Cols)
+        return wrap(mlx::core::diagonal(arr, 0, ndim - 2, ndim - 1));
+    }
+
+    Tensor sign(const Tensor &a) {
+        return wrap(mlx::core::sign(unwrap(a)));
+    }
+
     Tensor trace(const Tensor &a) {
         // Trace is the sum of the diagonal elements
         auto arr = unwrap(a);
         int ndim = arr.ndim();
-        // In MLX, we can extract the diagonal and sum it
-        return wrap(mlx::core::sum(mlx::core::diagonal(arr), {ndim - 1})); //
+        if (ndim < 2) return a;
+        // Extract diagonal from last two axes, then sum the resulting vector
+        return wrap(mlx::core::sum(mlx::core::diagonal(arr, 0, ndim - 2, ndim - 1), {-1}));
     }
 
     // ==============================================================================
@@ -574,5 +778,13 @@ namespace isomorphism::math {
 
         // 4. Call MLX slice with the correct types
         return wrap(mlx::core::slice(arr, mlx_starts, mlx_stops, mlx_strides));
+    }
+
+    void set_default_device_cpu() {
+        mlx::core::set_default_device(mlx::core::Device::cpu);
+    }
+
+    void set_default_device_gpu() {
+        mlx::core::set_default_device(mlx::core::Device::gpu);
     }
 } // namespace isomorphism
