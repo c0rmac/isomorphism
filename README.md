@@ -1,81 +1,206 @@
 # Isomorphism
 
-**Isomorphism** is a platform-agnostic C++ math wrapper that unifies **MLX** (Apple Silicon) and **SYCL** (oneMKL/PC) backends. It acts as a routing layer, translating high-level tensor operations into highly optimized native calls for the active hardware, ensuring seamless performance across disparate architectures.
+**Isomorphism** is a hardware-agnostic C++ tensor math library with a pluggable backend architecture. Write your mathematical logic once using a unified DSL and deploy it on any hardware — Apple Silicon, CPU, or GPU — by selecting a backend at compile time.
 
-By using Isomorphism, you write your mathematical logic once using a Domain Specific Language (DSL) and deploy it anywhere without worrying about the underlying silicon.
-
----
-
-## Key Features
-* **Platform-Agnostic DSL**: A unified interface for tensor operations including element-wise arithmetic and logical operations.
-* **Intelligent Routing**: Automatically dispatches math to MLX on Apple devices or SYCL/oneMKL on Intel/NVIDIA/AMD hardware.
-* **Heavy Linear Algebra**: Built-in support for SVD, QR decomposition, determinants, and linear system solvers.
-* **Seamless Integration**: Designed to be a lightweight dependency for any C++ project through a modern CMake interface.
+The Pimpl pattern keeps the public API entirely decoupled from the backend. Swapping from MLX to PyTorch is a single CMake flag change, with zero modifications to application code.
 
 ---
 
-## Installation
+## Backends
 
-The recommended way to install **Isomorphism** on macOS is via Homebrew. This ensures all backend dependencies, like MLX, are correctly configured.
+| Backend | Flag | Hardware | Dependency |
+|---|---|---|---|
+| **MLX** | `-DUSE_MLX=ON` | Apple Silicon (Metal/GPU) | [mlx](https://github.com/ml-explore/mlx) |
+| **Eigen** | `-DUSE_EIGEN=ON` | CPU (any platform) | [Eigen3](https://eigen.tuxfamily.org) |
+| **Torch** | `-DUSE_TORCH=ON` | CPU / CUDA / MPS | [LibTorch](https://pytorch.org) |
+
+Exactly one backend must be active per build.
+
+---
+
+## Installation via Homebrew
 
 ```bash
-# 1. Install MLX for macOS compatibility
-brew install mlx
-
-# 2. Tap the custom Isomorphism repository
+# Tap the repository
 brew tap c0rmac/homebrew-isomorphism
 
-# 3. Install the library
+# Auto-select (MLX on Apple Silicon, Eigen elsewhere)
 brew install isomorphism
+
+# Or choose a backend explicitly
+brew install isomorphism --with-mlx      # MLX Library exceptionally well optimised for the Apple Silicon GPU
+brew install isomorphism --with-eigen    # Eigen Library
+brew install isomorphism --with-torch    # PyTorch / LibTorch
 ```
+
+---
+
+## Building from Source
+
+```bash
+git clone https://github.com/c0rmac/isomorphism.git
+cd isomorphism
+cmake -S . -B build -DUSE_MLX=ON -DCMAKE_BUILD_TYPE=Release   # or USE_EIGEN / USE_TORCH
+cmake --build build
+cmake --install build
+```
+
+**PyTorch backend** — point CMake at your LibTorch installation:
+```bash
+cmake -S . -B build \
+  -DUSE_TORCH=ON \
+  -DCMAKE_PREFIX_PATH=/path/to/libtorch \
+  -DCMAKE_BUILD_TYPE=Release
+```
+On macOS with Homebrew, `abseil` must also be installed (`brew install abseil`) so that LibTorch's protobuf dependency resolves correctly.
+
+---
 
 ## Integrating with Your Project
 
-Once installed, you can integrate Isomorphism into your project using CMake. The package exports a clean target that handles all include paths and backend-specific linking automatically.
-
-### CMake Configuration
-Add the following to your `CMakeLists.txt`:
-
 ```cmake
-# 1. Locate the Isomorphism package
 find_package(isomorphism REQUIRED)
 
-# 2. Your executable
 add_executable(my_app main.cpp)
-
-# 3. Link the Isomorphism target
-# This automatically handles include paths and backend dependencies (like MLX/SYCL)
 target_link_libraries(my_app PRIVATE isomorphism::isomorphism)
 ```
 
-### Basic Usage
-```cmake
+That's it. Include paths and backend linking are handled by the exported target.
+
+---
+
+## API Overview
+
+All operations live in the `isomorphism::math` namespace and operate on the opaque `isomorphism::Tensor` handle.
+
+### Element-wise arithmetic
+```cpp
+math::add(a, b)        math::subtract(a, b)    math::multiply(a, b)
+math::divide(a, b)     math::pow(a, exp)        math::clamp(a, lo, hi)
+math::floor(a)         math::ceil(a)            math::round(a)
+math::minimum(a, b)    math::mean(a)
+```
+
+### Matrix operations
+```cpp
+math::matmul(a, b)
+math::transpose(a, axes)
+math::reshape(a, shape)
+math::broadcast_to(a, shape)
+math::expand_dims(a, axes)
+math::squeeze(a, axes)
+math::eye(d, dtype)
+math::full(shape, value, dtype)
+math::stack(tensors, axis)
+math::concatenate(tensors, axis)
+math::slice(a, start, end, axis)
+math::gather(a, indices, axis)
+```
+
+### Linear algebra
+```cpp
+math::matmul(a, b)                    // batched matrix multiply
+math::solve(A, b)                     // AX = B
+auto [U, S, Vh] = math::svd(a)        // singular value decomposition
+auto [Q, R]     = math::qr(a)         // QR decomposition
+math::inv(a)                          // matrix inverse
+math::det(a)                          // determinant
+math::trace(a)                        // sum of diagonal
+math::matrix_exp(a)                   // matrix exponential
+math::diag_embed(v)                   // 1D vector → diagonal matrix
+math::diag_extract(a)                 // diagonal matrix → 1D vector
+```
+
+### Reductions
+```cpp
+math::sum(a, axes)     math::prod(a, axes)     math::mean(a)
+math::min(a)           math::max(a)            math::argmax(a, axis)
+math::cumsum(a, axis)  math::all(a, axes)      math::any(a, axes)
+```
+
+### Activation / transcendental
+```cpp
+math::exp(a)    math::log(a)     math::sqrt(a)    math::square(a)
+math::abs(a)    math::sign(a)    math::sin(a)     math::cos(a)
+math::tan(a)    math::asin(a)    math::acos(a)    math::atan(a)
+math::atan2(y, x)
+```
+
+### Logical
+```cpp
+math::where(cond, x, y)
+math::equal(a, b)        math::not_equal(a, b)
+math::greater(a, b)      math::greater_equal(a, b)
+math::less(a, b)         math::less_equal(a, b)
+math::logical_and(a, b)  math::logical_or(a, b)
+```
+
+### Random
+```cpp
+math::random_normal(shape, dtype)
+math::random_uniform(shape, dtype)
+```
+
+### Spectral
+```cpp
+math::rfft(a, n, axis)
+math::irfft(a, n, axis)
+```
+
+### CPU / GPU bridge
+```cpp
+double            math::to_double(a)
+int               math::to_int(a)
+std::vector<float> math::to_float_vector(a)
+void              math::eval(a)               // no-op on eager backends
+void              math::set_default_device_cpu()
+void              math::set_default_device_gpu()
+```
+
+---
+
+## Quick Example
+
+```cpp
 #include <isomorphism/math.hpp>
 #include <isomorphism/tensor.hpp>
+#include <iostream>
 
 namespace iso = isomorphism;
+using namespace iso::math;
 
 int main() {
-    // Operations are automatically routed to the active backend (MLX or SYCL)
-    iso::Tensor a = iso::math::full({3, 3}, 1.0f, DType::Float32);
-    iso::Tensor b = iso::math::eye(3, DType::Float32);
-    
-    // Perform a batched matrix multiplication
-    iso::Tensor result = iso::math::matmul(a, b);
-    
-    // Explicitly execute the computation graph
-    iso::math::eval(result);
-    
+    // Create a batch of 4 random 3×3 matrices
+    iso::Tensor A = random_normal({4, 3, 3}, iso::DType::Float32);
+    iso::Tensor I = eye(3, iso::DType::Float32);
+
+    // Batched matmul — shape stays {4, 3, 3}
+    iso::Tensor result = matmul(A, broadcast_to(I, {4, 3, 3}));
+
+    // Pull a scalar to CPU
+    std::cout << "trace[0] = " << to_double(slice(trace(result), 0, 1, 0)) << "\n";
     return 0;
 }
 ```
 
+---
+
 ## Project Structure
-* `include/isomorphism/`: Contains the public API and hardware-agnostic DSL headers.
-* `src/backends/mlx/`: Implementation files for the Apple Silicon backend using the MLX framework.
-* `src/backends/sycl/`: Implementation files for the PC/Linux backend using SYCL and oneMKL.
+
+```
+include/isomorphism/
+    tensor.hpp          # Public Tensor handle (Pimpl)
+    math.hpp            # Full DSL — backend-agnostic
+
+src/backends/
+    mlx/                # Apple Silicon (MLX/Metal)
+    eigen/              # CPU (Eigen + OpenMP)
+    torch/              # PyTorch (LibTorch)
+    sycl/               # PC GPU (SYCL / oneMKL) — in progress
+```
 
 ---
 
 ## License
-This project is licensed under the MIT License.
+
+MIT
