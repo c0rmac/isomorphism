@@ -172,8 +172,24 @@ add_library(isomorphism ALIAS isomorphism_${_iso_default_backend})
 # 5. Installation & Export
 # ==============================================================================
 
-# Headers are shared by all backends — install once from the source tree.
+# Public headers (include/) are shared by all backends — install once.
 install(DIRECTORY include/ DESTINATION include)
+
+# Backend TensorImpl headers are required by the interop/ headers at consumer
+# compile time.  Install each one only when its backend was actually built.
+if (USE_MLX)
+    install(FILES src/backends/mlx/tensor_impl_mlx.hpp
+        DESTINATION include/isomorphism/src/backends/mlx)
+endif ()
+if (USE_EIGEN)
+    install(FILES src/backends/eigen/tensor_impl_eigen.hpp
+                  src/backends/eigen/memory_pool.hpp
+        DESTINATION include/isomorphism/src/backends/eigen)
+endif ()
+if (USE_TORCH)
+    install(FILES src/backends/torch/tensor_impl_torch.hpp
+        DESTINATION include/isomorphism/src/backends/torch)
+endif ()
 
 # Install all built backend libraries under the same export set.
 install(TARGETS ${_iso_install_targets}

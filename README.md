@@ -196,6 +196,74 @@ int main() {
 }
 ```
 
+### Interop: wrapping and unwrapping native types
+
+If you already hold a native tensor from your backend, use the interop headers
+to pass it into isomorphism and retrieve results without any data copy.
+
+#### MLX
+
+```cpp
+#include <isomorphism/interop/mlx.hpp>
+#include <mlx/mlx.h>
+
+namespace iso_mlx = isomorphism::interop::mlx;
+
+// Your existing MLX array — stays on the GPU, zero-copy
+mlx::core::array my_arr = mlx::core::random::normal({4, 3, 3});
+
+// Wrap: mlx::core::array → isomorphism::Tensor
+isomorphism::Tensor A = iso_mlx::wrap(my_arr);
+
+// Use the full isomorphism DSL
+isomorphism::Tensor result = isomorphism::math::matmul(A, A);
+isomorphism::math::eval(result);
+
+// Unwrap: isomorphism::Tensor → mlx::core::array (zero-copy view)
+mlx::core::array out = iso_mlx::unwrap(result);
+```
+
+#### PyTorch / LibTorch
+
+```cpp
+#include <isomorphism/interop/torch.hpp>
+#include <torch/torch.h>
+
+namespace iso_torch = isomorphism::interop::torch;
+
+// Your existing torch tensor
+torch::Tensor my_t = torch::randn({4, 3, 3});
+
+// Wrap: torch::Tensor → isomorphism::Tensor (shares LibTorch storage)
+isomorphism::Tensor A = iso_torch::wrap(my_t);
+
+isomorphism::Tensor result = isomorphism::math::matmul(A, A);
+
+// Unwrap: isomorphism::Tensor → torch::Tensor (zero-copy)
+torch::Tensor out = iso_torch::unwrap(result);
+```
+
+#### Eigen
+
+```cpp
+#include <isomorphism/interop/eigen.hpp>
+#include <Eigen/Dense>
+
+namespace iso_eigen = isomorphism::interop::eigen;
+
+// Your existing Eigen matrix — copied into isomorphism's pooled storage
+Eigen::MatrixXf M = Eigen::MatrixXf::Random(3, 3);
+isomorphism::Tensor A = iso_eigen::wrap(M);
+
+isomorphism::Tensor result = isomorphism::math::matmul(A, A);
+
+// Unwrap as a zero-copy Eigen::Map (contiguous tensors only)
+auto out_map = iso_eigen::to_matrix_map(result);   // Eigen::Map<MatrixXf>
+
+// Or copy into a new MatrixXf
+Eigen::MatrixXf out = iso_eigen::to_matrix(result);
+```
+
 ---
 
 ## Backends
