@@ -310,9 +310,9 @@ namespace isomorphism::math {
         mlx::core::array arr = unwrap(a);
 
         if (n == -1) {
-            return wrap(mlx::core::fft::rfft(arr, axis, device));
+            return wrap(mlx::core::fft::rfft(arr, axis, mlx::core::fft::FFTNorm::Backward, device));
         } else {
-            return wrap(mlx::core::fft::rfft(arr, n, axis, device));
+            return wrap(mlx::core::fft::rfft(arr, n, axis, mlx::core::fft::FFTNorm::Backward, device));
         }
     }
 
@@ -323,9 +323,9 @@ namespace isomorphism::math {
         mlx::core::array arr = unwrap(a);
 
         if (n == -1) {
-            return wrap(mlx::core::fft::irfft(arr, axis, device));
+            return wrap(mlx::core::fft::irfft(arr, axis, mlx::core::fft::FFTNorm::Backward, device));
         } else {
-            return wrap(mlx::core::fft::irfft(arr, n, axis, device));
+            return wrap(mlx::core::fft::irfft(arr, n, axis, mlx::core::fft::FFTNorm::Backward, device));
         }
     }
 
