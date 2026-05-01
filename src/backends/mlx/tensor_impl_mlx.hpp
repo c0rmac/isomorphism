@@ -14,6 +14,7 @@ namespace isomorphism {
     static inline mlx::core::Dtype get_mlx_dtype(DType dtype) {
         switch (dtype) {
             case DType::Float16:  return mlx::core::float16;
+            case DType::Float64:  return mlx::core::float64;
             case DType::BFloat16: return mlx::core::bfloat16;
             case DType::Float32:
             default:              return mlx::core::float32;

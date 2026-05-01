@@ -22,6 +22,7 @@ namespace isomorphism {
      * @brief Represents the data type of the underlying tensor memory.
      */
     enum class DType {
+        Float64,
         Float32,
         Float16,
         BFloat16

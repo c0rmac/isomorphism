@@ -1,10 +1,12 @@
 // Path: isomorphism/src/backends/mlx/math_mlx.cpp
 
 #include <iostream>
+#include <numeric>
 
 #include "isomorphism/math.hpp"
 #include "tensor_impl_mlx.hpp" // Our private header
 #include <mlx/mlx.h>
+#include "qr_accelerated/qr.h"
 #include <thread>
 #include <vector>
 
@@ -125,6 +127,11 @@ namespace isomorphism::math {
     }
 
     Tensor array(const std::vector<float> &data, const std::vector<int> &shape, DType dtype) {
+        mlx::core::Shape mlx_shape(shape.begin(), shape.end());
+        return wrap(mlx::core::array(data.data(), mlx_shape, get_mlx_dtype(dtype)));
+    }
+
+    Tensor array(const std::vector<double> &data, const std::vector<int> &shape, DType dtype) {
         mlx::core::Shape mlx_shape(shape.begin(), shape.end());
         return wrap(mlx::core::array(data.data(), mlx_shape, get_mlx_dtype(dtype)));
     }
@@ -322,6 +329,15 @@ namespace isomorphism::math {
         }
     }
 
+    Tensor norm(const Tensor &a, const std::vector<int> &axes) {
+        // mlx::core::linalg::norm defaults to the Frobenius norm for matrices
+        // (or L2 for vectors) when no 'ord' is specified.
+        if (axes.empty()) {
+            return wrap(mlx::core::linalg::norm(unwrap(a)));
+        }
+        return wrap(mlx::core::linalg::norm(unwrap(a), axes));
+    }
+
     // ==============================================================================
     // 5. HEAVY LINEAR ALGEBRA
     // ==============================================================================
@@ -411,10 +427,56 @@ namespace isomorphism::math {
         return {wrap(U), wrap(S), wrap(Vt)};
     }
 
+    std::tuple<Tensor, Tensor> eigh(const Tensor &a) {
+        mlx::core::array arr = unwrap(a);
+        mlx::core::Dtype orig_dtype = arr.dtype();
+
+        // Upcast low-precision inputs — eigh requires at least float32.
+        bool needs_cast = (orig_dtype == mlx::core::float16 ||
+                           orig_dtype == mlx::core::bfloat16);
+        if (needs_cast) {
+            arr = mlx::core::astype(arr, mlx::core::float32);
+        }
+
+        // Native MLX batched eigh (CPU evaluated for linalg ops)
+        // Using C++17 structured binding to unpack the std::pair directly
+        auto [vals, vecs] = mlx::core::linalg::eigh(arr, "L", mlx::core::Device::cpu);
+
+        if (needs_cast) {
+            vals = mlx::core::astype(vals, orig_dtype);
+            vecs = mlx::core::astype(vecs, orig_dtype);
+        }
+
+        return {wrap(vals), wrap(vecs)};
+    }
+
     std::tuple<Tensor, Tensor> qr(const Tensor &a) {
-        // mlx::core::linalg::qr returns a vector of arrays: {Q, R}
+        if (mlx::core::default_device() == mlx::core::Device::gpu) {
+            auto [q, r] = custom_math::qr_accelerated(unwrap(a));
+            return {wrap(q), wrap(r)};
+        }
         auto [q, r] = mlx::core::linalg::qr(unwrap(a), mlx::core::Device::cpu);
         return {wrap(q), wrap(r)};
+    }
+
+    Tensor eigvalsh(const Tensor &a) {
+        mlx::core::array arr = unwrap(a);
+        mlx::core::Dtype orig_dtype = arr.dtype();
+
+        // Upcast low-precision inputs — eigvalsh requires at least float32.
+        bool needs_cast = (orig_dtype == mlx::core::float16 ||
+                           orig_dtype == mlx::core::bfloat16);
+        if (needs_cast)
+            arr = mlx::core::astype(arr, mlx::core::float32);
+
+        // LAPACK dsyevd via MLX (CPU only for linalg ops).
+        mlx::core::array vals =
+            mlx::core::linalg::eigvalsh(arr, "L", mlx::core::Device::cpu);
+
+        if (needs_cast)
+            vals = mlx::core::astype(vals, orig_dtype);
+
+        return wrap(vals);
     }
 
 #include <dispatch/dispatch.h> // Apple's native parallelization library
@@ -424,6 +486,9 @@ namespace isomorphism::math {
     // ==============================================================================
     Tensor det(const Tensor &a) {
         mlx::core::array arr = unwrap(a);
+
+        // Safety: Force contiguity before reading raw pointer
+        arr = mlx::core::multiply(arr, mlx::core::array(1.0f, arr.dtype()));
 
         // 1. Force evaluation so the GPU finishes writing to unified memory
         mlx::core::eval({arr});
@@ -650,6 +715,241 @@ namespace isomorphism::math {
         return wrap(result);
     }
 
+    // ==============================================================================
+    // MATRIX LOGARITHM — Inverse Scaling-and-Squaring via Min-Max Computation Graphs
+    //
+    // Based on "Polynomial approximations for the matrix logarithm with
+    // computation graphs" (Jarlebring, Sastre, Javier, 2024).
+    //
+    // Phase 1: Scale A to near-identity using Denman-Beavers iteration until
+    //          ||A - I|| <= 0.1 (Theta_5 threshold).
+    // Phase 2: Compute degree-32 polynomial approximation of log(I+X) using the
+    //          k=5 min-max optimized computation graph (5 matmuls).
+    // Phase 3: Scale back log(A) = 2^s * log(A^{1/2^s}).
+    // ==============================================================================
+
+    Tensor matrix_log(const Tensor &a) {
+        mlx::core::array arr = unwrap(a);
+        mlx::core::Dtype orig_dtype = arr.dtype();
+
+        auto shape = arr.shape();
+        int ndim = static_cast<int>(shape.size());
+        int d = shape.back();
+        const mlx::core::Dtype f32 = mlx::core::float32;
+
+        bool needs_cast = (orig_dtype == mlx::core::float16 ||
+                           orig_dtype == mlx::core::bfloat16);
+        if (needs_cast)
+            arr = mlx::core::astype(arr, f32);
+
+        // ----------------------------------------------------------------------
+        // CASE: d = 2 (Analytical SO(2) Solution)
+        // ----------------------------------------------------------------------
+        if (d == 2) {
+            // Helper to slice a specific element (r, c) out of the batched matrices
+            auto get_elem = [&](int r, int c) {
+                std::vector<int> st(ndim, 0);
+                std::vector<int> sp(shape.begin(), shape.end());
+                std::vector<int> strides_vec(ndim, 1);
+
+                st[ndim - 2] = r; sp[ndim - 2] = r + 1;
+                st[ndim - 1] = c; sp[ndim - 1] = c + 1;
+
+                // Convert std::vector<int> to mlx::core::Shape as required by the C++ API
+                mlx::core::Shape mlx_st(st.begin(), st.end());
+                mlx::core::Shape mlx_sp(sp.begin(), sp.end());
+                mlx::core::Shape mlx_strides(strides_vec.begin(), strides_vec.end());
+
+                // Pass the Shape objects to slice
+                return mlx::core::squeeze(
+                    mlx::core::slice(arr, mlx_st, mlx_sp, mlx_strides),
+                    {ndim - 2, ndim - 1}
+                );
+            };
+
+            // R = [[A, -B], [B, A]]. Extract A and B.
+            auto A = get_elem(0, 0); // cos(theta)
+            auto B = get_elem(1, 0); // sin(theta)
+
+            auto theta = mlx::core::arctan2(B, A);
+            auto zero = mlx::core::zeros_like(theta);
+            auto neg_theta = mlx::core::negative(theta);
+
+            // Construct skew-symmetric matrix: [[0, -theta], [theta, 0]]
+            auto row0 = mlx::core::stack({zero, neg_theta}, -1);
+            auto row1 = mlx::core::stack({theta, zero}, -1);
+            auto result = mlx::core::stack({row0, row1}, -2);
+
+            // Restore Original Precision
+            if (needs_cast) {
+                result = mlx::core::astype(result, orig_dtype);
+            }
+
+            return wrap(result);
+        }
+        // ----------------------------------------------------------------------
+        // CASE: d = 3 (Analytical SO(3) Solution via Inverse Rodrigues)
+        // ----------------------------------------------------------------------
+        else if (d == 3) {
+            // 1. Calculate trace(R)
+            auto trace_R = mlx::core::sum(mlx::core::diagonal(arr, 0, ndim - 2, ndim - 1), {-1});
+
+            // 2. Extract angle theta = arccos((trace - 1) / 2)
+            auto val = mlx::core::divide(
+                mlx::core::subtract(trace_R, mlx::core::array(1.0f, f32)),
+                mlx::core::array(2.0f, f32)
+            );
+            // Clamp to [-1, 1] to prevent NaN in arccos due to float precision
+            val = mlx::core::clip(val, mlx::core::array(-1.0f, f32), mlx::core::array(1.0f, f32));
+            auto theta = mlx::core::arccos(val);
+            auto sin_theta = mlx::core::sin(theta);
+
+            // 3. Compute R - R^T
+            std::vector<int> transp_axes(ndim);
+            std::iota(transp_axes.begin(), transp_axes.end(), 0);
+            std::swap(transp_axes[ndim - 1], transp_axes[ndim - 2]);
+            auto R_T = mlx::core::transpose(arr, transp_axes);
+            auto diff = mlx::core::subtract(arr, R_T);
+
+            // 4. Compute multiplier = theta / (2 * sin(theta))
+            // To prevent 0/0 division when theta ~ 0, we use a threshold and Taylor expansion
+            auto eps = mlx::core::array(1e-4f, f32);
+            auto is_zero = mlx::core::less(mlx::core::abs(theta), eps);
+
+            // Taylor expansion of x / (2*sin(x)) near x=0 is 0.5 + x^2 / 12
+            auto theta_sq = mlx::core::square(theta);
+            auto taylor_mult = mlx::core::add(
+                mlx::core::array(0.5f, f32),
+                mlx::core::divide(theta_sq, mlx::core::array(12.0f, f32))
+            );
+
+            // Standard exact multiplier for safe zones
+            // Note: This implementation assumes theta < pi - eps. Handling exact pi
+            // rotations robustly in a pure vectorized graph requires an eigenvector branch.
+            auto safe_sin = mlx::core::where(is_zero, eps, sin_theta);
+            auto exact_mult = mlx::core::divide(theta, mlx::core::multiply(mlx::core::array(2.0f, f32), safe_sin));
+
+            auto mult = mlx::core::where(is_zero, taylor_mult, exact_mult);
+
+            // Expand dimensions to broadcast multiplier across the [..., 3, 3] matrices
+            auto mult_expanded = mlx::core::expand_dims(mlx::core::expand_dims(mult, -1), -1);
+            auto result = mlx::core::multiply(mult_expanded, diff);
+
+            // Restore Original Precision
+            if (needs_cast) {
+                result = mlx::core::astype(result, orig_dtype);
+            }
+
+            return wrap(result);
+        }
+
+        // --- Denman-Beavers matrix square root ---
+        auto denman_beavers = [&](mlx::core::array Y) -> mlx::core::array {
+            mlx::core::array Z = mlx::core::eye(d, f32);
+            for (int iter = 0; iter < 6; ++iter) {
+                mlx::core::array Yinv = mlx::core::linalg::inv(Y, mlx::core::Device::cpu);
+                mlx::core::array Zinv = mlx::core::linalg::inv(Z, mlx::core::Device::cpu);
+                mlx::core::array Ynew = mlx::core::multiply(
+                    mlx::core::add(Y, Zinv), mlx::core::array(0.5f, f32));
+                Z = mlx::core::multiply(
+                    mlx::core::add(Z, Yinv), mlx::core::array(0.5f, f32));
+                Y = Ynew;
+                mlx::core::eval({Y, Z});
+            }
+            return Y;
+        };
+
+        // ----------------------------------------------------------------------
+        // CASE: d > 3 (General Fallback - Min-Max Polynomial)
+        // ----------------------------------------------------------------------
+
+        // --- Phase 1: Scale down to near-identity (Theta_5 = 0.1 threshold) ---
+        const double kTheta5 = 0.1;
+        int s = 0;
+        mlx::core::array As = arr;
+        while (true) {
+            mlx::core::array diff    = mlx::core::subtract(As, mlx::core::eye(d, f32));
+            mlx::core::array abs_d   = mlx::core::abs(diff);
+            mlx::core::array col_sum = mlx::core::sum(abs_d, {ndim - 2});
+            mlx::core::array row_max = mlx::core::max(col_sum, {ndim - 2});
+            mlx::core::array g_max   = mlx::core::max(row_max);
+            mlx::core::eval({g_max});
+            double norm1 = static_cast<double>(g_max.item<float>());
+
+            if (norm1 <= kTheta5 || s >= 16) break;
+
+            As = denman_beavers(As);
+            ++s;
+        }
+
+        // --- Phase 2: k=5 Min-Max Computation Graph Evaluation ---
+        // We approximate f(A) = -log(I-X).
+        // Therefore, log(A_s) = log(I + (A_s - I)) approx -z(-(A_s - I)) = -z(I - A_s)
+        mlx::core::array X = mlx::core::subtract(mlx::core::eye(d, f32), As);
+
+        // Helper for scalar multiplication
+        auto sc = [&](float c, const mlx::core::array& M) {
+            return mlx::core::multiply(M, mlx::core::array(c, f32));
+        };
+
+        // Node P2 and P3
+        mlx::core::array P2 = X;
+        mlx::core::array P3 = mlx::core::matmul(X, X);
+
+        // Node P4
+        mlx::core::array P4_h = mlx::core::add(sc(7.363757032799957e-02f, P2), sc(-1.050281301619960e+00f, P3));
+        mlx::core::array P4_g = mlx::core::add(sc(-9.666134174379001e-01f, P2), sc(-4.395519034717933e-01f, P3));
+        mlx::core::array P4   = mlx::core::matmul(P4_h, P4_g);
+
+        // Node P5
+        mlx::core::array P5_h = mlx::core::add(sc(8.897468955192446e-02f, P2),
+                                mlx::core::add(sc(-1.599651928992725e-01f, P3), sc(9.577281350989334e-01f, P4)));
+        mlx::core::array P5_g = mlx::core::add(sc(1.048664069004776e-01f, P2),
+                                mlx::core::add(sc(1.585606124033259e-01f, P3), sc(1.668066506920988e-01f, P4)));
+        mlx::core::array P5   = mlx::core::matmul(P5_h, P5_g);
+
+        // Node P6
+        mlx::core::array P6_h = mlx::core::add(sc(5.394999133948797e-01f, P2),
+                                mlx::core::add(sc(6.700731102561937e-02f, P3),
+                                mlx::core::add(sc(-5.158769100223212e-02f, P4), sc(1.094308587350110e+00f, P5))));
+        mlx::core::array P6_g = mlx::core::add(sc(-8.025600931705978e-02f, P2),
+                                mlx::core::add(sc(-1.159854366397558e-01f, P3),
+                                mlx::core::add(sc(1.066554944706011e-01f, P4), sc(1.127094008297975e+00f, P5))));
+        mlx::core::array P6   = mlx::core::matmul(P6_h, P6_g);
+
+        // Node P7
+        mlx::core::array P7_h = mlx::core::add(sc(1.027072285939197e-01f, P2),
+                                mlx::core::add(sc(-8.964023050065877e-03f, P3),
+                                mlx::core::add(sc(-2.100705663612491e-01f, P4),
+                                mlx::core::add(sc(1.949655359168707e-01f, P5), sc(1.117368056772713e+00f, P6)))));
+        mlx::core::array P7_g = mlx::core::add(sc(2.702180425508705e-01f, P2),
+                                mlx::core::add(sc(4.137541209720699e-02f, P3),
+                                mlx::core::add(sc(4.857347452405025e-01f, P4),
+                                mlx::core::add(sc(-6.000256005636980e-01f, P5), sc(1.063393233943084e+00f, P6)))));
+        mlx::core::array P7   = mlx::core::matmul(P7_h, P7_g);
+
+        // Final linear combination z(X)
+        mlx::core::array z = mlx::core::add(sc(1.0f, P2),
+                             mlx::core::add(sc(5.065546620208965e-01f, P3),
+                             mlx::core::add(sc(3.832512052972577e-01f, P4),
+                             mlx::core::add(sc(1.088307723749078e+00f, P5),
+                             mlx::core::add(sc(2.787461897212877e-01f, P6), sc(8.157421998489228e-01f, P7))))));
+
+        // Result L_s = -z(I - A_s)
+        mlx::core::array result = sc(-1.0f, z);
+
+        // --- Phase 3: Undo Scaling ---
+        if (s > 0) {
+            float scale = std::pow(2.0f, static_cast<float>(s));
+            result = mlx::core::multiply(result, mlx::core::array(scale, f32));
+        }
+
+        if (needs_cast)
+            result = mlx::core::astype(result, orig_dtype);
+
+        return wrap(result);
+    }
+
     Tensor diag_embed(const Tensor &v) {
         // Creates a square diagonal matrix from a 1D tensor
         return wrap(mlx::core::diag(unwrap(v), 0));
@@ -719,20 +1019,38 @@ namespace isomorphism::math {
     std::vector<float> to_float_vector(const Tensor &a) {
         mlx::core::array arr = unwrap(a);
 
-        // Ensure the array is evaluated and synchronized with the CPU
-        mlx::core::eval({arr});
+        // FIX: Force the array to be contiguous. Multiplying by 1 allocates a fresh,
+        // densely packed memory buffer, eliminating any strides from previous slices.
+        arr = mlx::core::multiply(arr, mlx::core::array(1.0f, arr.dtype()));
 
-        // Check if the data is already double; if not, cast it
         if (arr.dtype() != mlx::core::float32) {
             arr = mlx::core::astype(arr, mlx::core::float32);
-            mlx::core::eval({arr});
         }
+
+        mlx::core::eval({arr});
 
         const float *data_ptr = arr.data<float>();
         size_t size = arr.size();
 
-        // Construct the vector using the pointer range
         return std::vector<float>(data_ptr, data_ptr + size);
+    }
+
+    std::vector<double> to_double_vector(const Tensor &a) {
+        mlx::core::array arr = unwrap(a);
+
+        // FIX: Force contiguity.
+        arr = mlx::core::multiply(arr, mlx::core::array(1.0f, arr.dtype()));
+
+        if (arr.dtype() != mlx::core::float64) {
+            arr = mlx::core::astype(arr, mlx::core::float64);
+        }
+
+        mlx::core::eval({arr});
+
+        const double *data_ptr = arr.data<double>();
+        size_t size = arr.size();
+
+        return std::vector<double>(data_ptr, data_ptr + size);
     }
 
     int to_int(const Tensor &a) {

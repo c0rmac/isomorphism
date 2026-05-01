@@ -60,16 +60,16 @@ macro(isomorphism_add_backend _name _define)
     target_compile_definitions(isomorphism_${_name} PUBLIC ${_define})
 
     if (CMAKE_BUILD_TYPE STREQUAL "Debug")
-        set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fsanitize=address -fsanitize=undefined -g")
+        set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fsanitize=address -fsanitize=undefined -fno-omit-frame-pointer -fno-optimize-sibling-calls -O0 -g")
+        #set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fsanitize=address -fsanitize=undefined -g")
         if (CMAKE_CXX_COMPILER_ID MATCHES "Clang|AppleClang|GNU")
-            target_compile_options(isomorphism_${_name} PRIVATE
-                -g -fno-omit-frame-pointer -fstack-protector-strong)
+            #target_compile_options(isomorphism_${_name} PRIVATE  -g -fno-omit-frame-pointer -fstack-protector-strong)
         endif ()
     endif ()
 
     if (CMAKE_BUILD_TYPE STREQUAL "Release")
         if (CMAKE_CXX_COMPILER_ID MATCHES "Clang|AppleClang|GNU")
-            target_compile_options(isomorphism_${_name} PRIVATE -O3 -ffast-math -march=native)
+            target_compile_options(isomorphism_${_name} PRIVATE -O3 -march=native)
         endif ()
     endif ()
 
@@ -92,12 +92,62 @@ endmacro()
 # --- Apple Silicon / MLX ---
 if (USE_MLX)
     message(STATUS "Isomorphism: Building MLX backend (Apple Silicon)")
+    enable_language(OBJCXX)
     find_package(MLX REQUIRED)
+
+    # --- QR_Unblocked.metallib (M > 512) ---
+    set(_qr_unblocked_metallib "${CMAKE_CURRENT_SOURCE_DIR}/qr_accelerated/QR_Unblocked.metallib")
+    if (NOT EXISTS "${_qr_unblocked_metallib}")
+        message(STATUS "Isomorphism: Compiling QR_Unblocked.metal → metallib")
+        execute_process(
+            COMMAND xcrun -sdk macosx metal -c
+                    "${CMAKE_CURRENT_SOURCE_DIR}/qr_accelerated/QR_Unblocked.metal"
+                    -o "${CMAKE_CURRENT_BINARY_DIR}/QR_Unblocked.air"
+            COMMAND_ERROR_IS_FATAL ANY
+        )
+        execute_process(
+            COMMAND xcrun -sdk macosx metallib
+                    "${CMAKE_CURRENT_BINARY_DIR}/QR_Unblocked.air"
+                    -o "${_qr_unblocked_metallib}"
+            COMMAND_ERROR_IS_FATAL ANY
+        )
+    endif ()
+
+    # --- QR_Streaming_AMX.metallib (M <= 512) ---
+    set(_qr_streaming_amx_metallib "${CMAKE_CURRENT_SOURCE_DIR}/qr_accelerated/QR_Streaming_AMX.metallib")
+    if (NOT EXISTS "${_qr_streaming_amx_metallib}")
+        message(STATUS "Isomorphism: Compiling QR_Streaming_AMX.metal → metallib")
+        execute_process(
+            COMMAND xcrun -sdk macosx metal -c
+                    "${CMAKE_CURRENT_SOURCE_DIR}/qr_accelerated/QR_Streaming_AMX.metal"
+                    -o "${CMAKE_CURRENT_BINARY_DIR}/QR_Streaming_AMX.air"
+            COMMAND_ERROR_IS_FATAL ANY
+        )
+        execute_process(
+            COMMAND xcrun -sdk macosx metallib
+                    "${CMAKE_CURRENT_BINARY_DIR}/QR_Streaming_AMX.air"
+                    -o "${_qr_streaming_amx_metallib}"
+            COMMAND_ERROR_IS_FATAL ANY
+        )
+    endif ()
+
     isomorphism_add_backend(mlx USE_MLX
         src/backends/mlx/tensor_mlx.cpp
         src/backends/mlx/math_mlx.cpp
+        qr_accelerated/qr_unblocked.mm
+        qr_accelerated/qr_streaming_amx.mm
+        qr_accelerated/qr_dispatch.mm
     )
-    target_link_libraries(isomorphism_mlx PRIVATE mlx)
+    target_include_directories(isomorphism_mlx PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
+    target_compile_definitions(isomorphism_mlx PRIVATE
+        "QR_UNBLOCKED_METALLIB_PATH=\"${_qr_unblocked_metallib}\""
+        "QR_STREAMING_AMX_METALLIB_PATH=\"${_qr_streaming_amx_metallib}\""
+    )
+    target_link_libraries(isomorphism_mlx PRIVATE
+        mlx
+        "-framework Metal"
+        "-framework Foundation"
+    )
 endif ()
 
 # --- Eigen CPU ---

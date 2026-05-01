@@ -28,6 +28,7 @@ static mlx::core::Dtype to_mlx_dtype(DType dtype) {
     switch (dtype) {
         case DType::Float16:  return mlx::core::float16;
         case DType::BFloat16: return mlx::core::bfloat16;
+        case DType::Float64: return mlx::core::float64;
         case DType::Float32:
         default:              return mlx::core::float32;
     }
@@ -128,22 +129,35 @@ static void print_recursive(std::ostream& os, const float* data, const std::vect
     }
 }
 
-/**
- * @brief Overload for standard output streams to print the underlying tensor data.
- */
-std::ostream& operator<<(std::ostream& os, const Tensor& tensor) {
+    /**
+     * @brief Overload for standard output streams to print the underlying tensor data.
+     */
+    std::ostream& operator<<(std::ostream& os, const Tensor& tensor) {
     auto impl = tensor.get_impl();
     if (!impl) {
         return os << "Tensor(Null)";
     }
 
-    // 1. Force the MLX backend to execute pending operations in the compute graph
-    mlx::core::eval({impl->data});
+    // --- FIX: Force Contiguous Memory ---
+    // Make a copy of the MLX array
+    mlx::core::array arr = impl->data;
+
+    // Multiplying by 1.0 allocates a fresh, densely-packed memory buffer,
+    // which eliminates any complex strides left over from math::slice.
+    arr = mlx::core::multiply(arr, mlx::core::array(1.0f, arr.dtype()));
+
+    // Ensure it's Float32 for our raw C++ pointer cast below
+    if (arr.dtype() != mlx::core::float32) {
+        arr = mlx::core::astype(arr, mlx::core::float32);
+    }
+
+    // Force the Apple GPU to execute the graph and sync memory
+    mlx::core::eval({arr});
 
     // 2. Extract shape
     auto shape = tensor.shape();
 
-    // 3. Compute flat memory strides (assuming contiguous C-style memory for printing)
+    // 3. Compute flat memory strides (now safe because we forced contiguous memory above)
     std::vector<size_t> strides(shape.size(), 1);
     if (!shape.empty()) {
         for (int i = static_cast<int>(shape.size()) - 2; i >= 0; --i) {
@@ -151,8 +165,8 @@ std::ostream& operator<<(std::ostream& os, const Tensor& tensor) {
         }
     }
 
-    // 4. Safely grab the raw float pointer from the MLX array
-    const float* ptr = impl->data.data<float>();
+    // 4. Safely grab the raw float pointer from our new contiguous MLX array
+    const float* ptr = arr.data<float>();
 
     // 5. Print the header
     os << "Tensor(shape={";

@@ -304,6 +304,14 @@ namespace isomorphism::math {
         return wrap(torch::linalg_inv(unwrap(a)));
     }
 
+    Tensor eigvalsh(const Tensor& a) {
+        auto t = unwrap(a);
+        auto original_device = t.device();
+        // torch::linalg_eigvalsh returns eigenvalues in ascending order.
+        auto vals = torch::linalg_eigvalsh(t.to(torch::kCPU), "L");
+        return wrap(vals.to(original_device));
+    }
+
     /*
     // Adaptive Padé matrix exponential — fully supported in PyTorch linalg.
     Tensor matrix_exp(const Tensor& a) {
@@ -397,6 +405,77 @@ namespace isomorphism::math {
         if (needs_cast) {
             result = result.to(orig_dtype);
         }
+
+        return wrap(result);
+    }
+
+    Tensor matrix_log(const Tensor& a) {
+        torch::Tensor arr = unwrap(a);
+        torch::ScalarType orig_dtype = arr.scalar_type();
+
+        bool needs_cast = (orig_dtype == torch::kFloat16 || orig_dtype == torch::kBFloat16);
+        if (needs_cast)
+            arr = arr.to(torch::kFloat32);
+
+        int ndim = arr.dim();
+        int d = arr.size(-1);
+        auto dev = arr.device();
+        auto opts = torch::TensorOptions().dtype(torch::kFloat32).device(dev);
+
+        static constexpr float kNodes[8] = {
+            0.019855072f, 0.101666761f, 0.237233795f, 0.408282679f,
+            0.591717321f, 0.762766205f, 0.898333239f, 0.980144928f
+        };
+        static constexpr float kWeights[8] = {
+            0.050614268f, 0.111190517f, 0.156853323f, 0.181341892f,
+            0.181341892f, 0.156853323f, 0.111190517f, 0.050614268f
+        };
+
+        // Denman-Beavers matrix square root via coupled iteration.
+        auto denman_beavers = [&](torch::Tensor Y) -> torch::Tensor {
+            torch::Tensor Z = torch::eye(d, opts);  // broadcasts with batch
+            for (int iter = 0; iter < 6; ++iter) {
+                torch::Tensor Yinv = torch::linalg_inv(Y);
+                torch::Tensor Zinv = torch::linalg_inv(Z);
+                torch::Tensor Ynew = (Y + Zinv) * 0.5f;
+                Z = (Z + Yinv) * 0.5f;
+                Y = Ynew;
+            }
+            return Y;
+        };
+
+        // Phase 1: scale down via repeated square roots until ||Ak - I||₁ ≤ 0.75.
+        const double kThreshold = 0.75;
+        int k = 0;
+        torch::Tensor Ak = arr;
+        while (true) {
+            torch::Tensor diff    = Ak - torch::eye(d, opts);
+            torch::Tensor col_sum = torch::sum(torch::abs(diff), /*dim=*/-2);
+            torch::Tensor g_max   = torch::max(col_sum);
+            double norm1 = static_cast<double>(g_max.item<float>());
+
+            if (norm1 <= kThreshold || k >= 16) break;
+
+            Ak = denman_beavers(Ak);
+            ++k;
+        }
+
+        // Phase 2: log(I+X) = ∫₀¹ X(I+tX)⁻¹ dt via 8-point Gauss-Legendre.
+        torch::Tensor X      = Ak - torch::eye(d, opts);
+        torch::Tensor result = torch::zeros_like(X);
+        for (int j = 0; j < 8; ++j) {
+            torch::Tensor denom   = torch::eye(d, opts) + X * kNodes[j];
+            // solve(denom, X) = denom^{-1} X
+            torch::Tensor contrib = unwrap(solve(wrap(denom), wrap(X)));
+            result = result + contrib * kWeights[j];
+        }
+
+        // Phase 3: undo scaling.
+        if (k > 0)
+            result = result * std::pow(2.0f, static_cast<float>(k));
+
+        if (needs_cast)
+            result = result.to(orig_dtype);
 
         return wrap(result);
     }

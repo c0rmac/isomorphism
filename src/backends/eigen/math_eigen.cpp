@@ -978,6 +978,25 @@ Tensor matrix_exp(const Tensor& a) {
     return Tensor(res_impl, DType::Float32);
 }
 
+Tensor matrix_log(const Tensor& a) {
+    Tensor ca = contiguous(a);
+    int d = ca.shape().back();
+    int bat = ca.size() / (d * d);
+    auto res_impl = std::make_shared<TensorImpl>(ca.shape());
+
+    float* pA = unwrap(ca).data_ptr.get();
+    float* pR = res_impl->data_ptr.get();
+
+    #pragma omp parallel for schedule(static)
+    for (int i = 0; i < bat; ++i) {
+        Eigen::Map<const Mat> mapA(pA + i * d * d, d, d);
+        Eigen::Map<Mat> mapRes(pR + i * d * d, d, d);
+        mapRes.noalias() = mapA.log();
+    }
+
+    return Tensor(res_impl, DType::Float32);
+}
+
 std::tuple<Tensor, Tensor> qr(const Tensor& a) {
     Tensor ca = contiguous(a);
     int M = ca.shape()[ca.ndim()-2];
@@ -1233,6 +1252,35 @@ Tensor slice(const Tensor &a, int start, int end, int axis) {
 
     // Return a new view sharing the same underlying data_ptr
     return wrap_view(impl.data_ptr, new_shape, impl.strides, new_offset);
+}
+
+Tensor eigvalsh(const Tensor& a) {
+    Tensor ca  = contiguous(a);
+    int    d   = ca.shape().back();
+    int    bat = ca.size() / (d * d);
+
+    // Output shape: drop the last dimension → [..., d].
+    auto shape_out = ca.shape();
+    shape_out.pop_back();
+    auto impl = std::make_shared<TensorImpl>(shape_out);
+
+    const float* pA   = unwrap(ca).data_ptr.get();
+    float*       pOut = impl->data_ptr.get();
+
+    #pragma omp parallel if(bat > 1)
+    {
+        // Hoist solver workspace: one allocation per thread.
+        Eigen::SelfAdjointEigenSolver<Mat> solver(d);
+
+        #pragma omp for schedule(static)
+        for (int i = 0; i < bat; ++i) {
+            Eigen::Map<const Mat> mapA(pA   + i * d * d, d, d);
+            Eigen::Map<Vec>       mapV(pOut + i * d,     d);
+            solver.compute(mapA, Eigen::EigenvaluesOnly);
+            mapV = solver.eigenvalues();
+        }
+    }
+    return Tensor(impl, DType::Float32);
 }
 
 void set_default_device_cpu() {

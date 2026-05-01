@@ -84,6 +84,9 @@ namespace isomorphism::math {
     /** @brief Creates a tensor from a raw C++ vector of floats. */
     Tensor array(const std::vector<float> &data, const std::vector<int> &shape, DType dtype);
 
+    /** @brief Creates a tensor from a raw C++ vector of doubles. */
+    Tensor array(const std::vector<double> &data, const std::vector<int> &shape, DType dtype);
+
     /** @brief Casts a tensor to Int32 for index lookups on the GPU. */
     Tensor astype_int32(const Tensor &a);
 
@@ -218,6 +221,12 @@ namespace isomorphism::math {
      */
     Tensor irfft(const Tensor &a, int n = -1, int axis = -1);
 
+    /** * @brief Computes the norm of a tensor along specified axes.
+     * If axes is empty, sums all elements into a scalar norm.
+     * For a batch of matrices [N, d, d], use axes = {-2, -1} to get N norms.
+     */
+    Tensor norm(const Tensor &a, const std::vector<int> &axes = {});
+
     // ==============================================================================
     // 5. HEAVY LINEAR ALGEBRA
     // ==============================================================================
@@ -232,6 +241,13 @@ namespace isomorphism::math {
      * Required for projecting the ambient Fréchet mean back onto the SO(d) manifold.
      */
     std::tuple<Tensor, Tensor, Tensor> svd(const Tensor &a);
+
+    /** * @brief Batched Eigenvalue Decomposition for Symmetric Matrices.
+     * Computes the eigenvalues and eigenvectors of a batch of symmetric matrices
+     * using a multi-threaded C++ Jacobi algorithm.
+     * @return A tuple of 2 tensors: {Eigenvalues [..., d], Eigenvectors [..., d, d]}.
+     */
+    std::tuple<Tensor, Tensor> eigh(const Tensor &a);
 
     /** * @brief Computes the matrix exponential via adaptive diagonal Padé approximants.
      *
@@ -252,6 +268,28 @@ namespace isomorphism::math {
      */
     Tensor matrix_exp(const Tensor &a);
 
+    /**
+     * @brief Batched principal matrix logarithm.
+     *
+     * Computes log(A) for each matrix in the batch, defined as the unique X
+     * satisfying exp(X) = A whose eigenvalues have imaginary part in (-π, π].
+     * For A ∈ SO(d) this returns the unique skew-symmetric Lie algebra element Ω
+     * such that exp(Ω) = A (the Riemannian log map at the identity).
+     *
+     * Algorithm: inverse scaling-and-squaring.
+     *   1. Find minimum k ≥ 0 such that ||A^{1/2^k} − I||₁ ≤ θ.
+     *      Matrix square roots are computed via the Denman-Beavers iteration.
+     *   2. Evaluate log(A^{1/2^k}) = log(I + X) via 8-point Gauss-Legendre
+     *      quadrature of the integral representation
+     *        log(I + X) = ∫₀¹ X (I + t X)⁻¹ dt.
+     *   3. Recover log(A) = 2^k · log(A^{1/2^k}).
+     *
+     * @param a [..., d, d] tensor; each matrix must be invertible with no
+     *          eigenvalue on the negative real axis.
+     * @return  [..., d, d] tensor of the same dtype.
+     */
+    Tensor matrix_log(const Tensor &a);
+
     /** * @brief Creates a 2D diagonal matrix from a 1D tensor.
      * Given a vector v of length k, returns the k x k matrix with v on the main diagonal.
      */
@@ -271,6 +309,21 @@ namespace isomorphism::math {
      * matrix onto the orthogonal group in a single, non-iterative pass.
      */
     std::tuple<Tensor, Tensor> qr(const Tensor &a);
+
+    /**
+     * @brief Batched eigenvalues of a real symmetric (or complex Hermitian) matrix.
+     *
+     * Equivalent to LAPACK dsyevd / ssyevd.  Uses the lower triangle of each
+     * matrix by default.  Eigenvalues are returned in ascending order.
+     *
+     * For a real skew-symmetric matrix Ω, calling eigvalsh(Ω·Ωᵀ) yields the
+     * squared principal angles θⱼ² at cost O(d³/3) — roughly 3–4× cheaper than
+     * a full SVD because no singular vectors are computed.
+     *
+     * @param a  [..., d, d] symmetric tensor.
+     * @return   [..., d] tensor of eigenvalues in ascending order.
+     */
+    Tensor eigvalsh(const Tensor &a);
 
     /** * @brief Computes the determinant of a square matrix or a batch of square matrices.
      * @return A tensor containing the determinant(s).
@@ -307,6 +360,8 @@ namespace isomorphism::math {
     double to_double(const Tensor &a);
 
     std::vector<float> to_float_vector(const Tensor &a);
+
+    std::vector<double> to_double_vector(const Tensor &a);
 
     /** @brief Explicitly executes the pending computation graph for this tensor. */
     void eval(const Tensor &a);
