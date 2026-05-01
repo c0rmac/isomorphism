@@ -48,7 +48,10 @@ macro(isomorphism_add_backend _name _define)
     set(_sources ${ARGN})
 
     add_library(isomorphism_${_name} ${_sources})
-    set_target_properties(isomorphism_${_name} PROPERTIES OUTPUT_NAME "isomorphism_${_name}")
+    set_target_properties(isomorphism_${_name} PROPERTIES
+        OUTPUT_NAME  "isomorphism_${_name}"   # library file stays libisomorphism_mlx.dylib
+        EXPORT_NAME  "${_name}"               # exported as isomorphism::mlx (not isomorphism::isomorphism_mlx)
+    )
 
     target_include_directories(isomorphism_${_name} PUBLIC
         $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
