@@ -8,17 +8,25 @@ The Pimpl pattern keeps the public API entirely decoupled from the backend. Swap
 
 ## Installation via Homebrew
 
+Each backend is a separate formula. Add the tap once, then install the formula that matches your hardware:
+
 ```bash
-# Tap the repository
 brew tap c0rmac/homebrew-isomorphism
+```
 
-# Auto-select (MLX on Apple Silicon, Eigen elsewhere)
-brew install isomorphism
+**Apple MLX** — recommended on Apple Silicon (M1/M2/M3/M4), uses the Metal GPU:
+```bash
+brew install isomorphism-mlx
+```
 
-# Or choose a backend explicitly
-brew install isomorphism --with-mlx      # MLX Library exceptionally well optimised for the Apple Silicon GPU
-brew install isomorphism --with-eigen    # Eigen Library
-brew install isomorphism --with-torch    # PyTorch / LibTorch
+**Eigen** — lightweight CPU-only, no large framework dependency:
+```bash
+brew install isomorphism-eigen
+```
+
+**LibTorch** — for LibTorch / PyTorch users:
+```bash
+brew install isomorphism-torch
 ```
 
 ---
