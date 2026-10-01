@@ -8,6 +8,7 @@ namespace isomorphism {
 
     static inline torch::ScalarType get_torch_dtype(DType dtype) {
         switch (dtype) {
+            case DType::Float64:  return torch::kFloat64;
             case DType::Float16:  return torch::kFloat16;
             case DType::BFloat16: return torch::kBFloat16;
             case DType::Float32:

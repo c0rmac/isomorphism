@@ -37,9 +37,11 @@
 #if __has_include(<isomorphism/src/backends/mlx/tensor_impl_mlx.hpp>)
 #  include <isomorphism/src/backends/mlx/tensor_impl_mlx.hpp>
 #else
-#  include "../../src/backends/mlx/tensor_impl_mlx.hpp"
+#  include "../../../src/backends/mlx/tensor_impl_mlx.hpp"
 #endif
 
+// Inside this namespace a bare `mlx` names the namespace itself, so the library's is
+// spelled ::mlx throughout.
 namespace isomorphism::interop::mlx {
 
 /**
@@ -51,10 +53,10 @@ namespace isomorphism::interop::mlx {
  * @param arr  The MLX array to wrap.
  * @return     An isomorphism::Tensor backed by @p arr.
  */
-inline isomorphism::Tensor wrap(mlx::core::array arr) {
+inline isomorphism::Tensor wrap(::mlx::core::array arr) {
     auto dtype = [&]() -> isomorphism::DType {
-        if (arr.dtype() == mlx::core::float16)  return isomorphism::DType::Float16;
-        if (arr.dtype() == mlx::core::bfloat16) return isomorphism::DType::BFloat16;
+        if (arr.dtype() == ::mlx::core::float16)  return isomorphism::DType::Float16;
+        if (arr.dtype() == ::mlx::core::bfloat16) return isomorphism::DType::BFloat16;
         return isomorphism::DType::Float32;
     }();
     return isomorphism::Tensor(
@@ -71,7 +73,7 @@ inline isomorphism::Tensor wrap(mlx::core::array arr) {
  * @param t  A Tensor created by the MLX backend.
  * @return   The underlying mlx::core::array.
  */
-inline mlx::core::array unwrap(const isomorphism::Tensor& t) {
+inline ::mlx::core::array unwrap(const isomorphism::Tensor& t) {
     return t.get_impl()->data;
 }
 

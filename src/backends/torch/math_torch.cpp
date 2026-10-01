@@ -18,8 +18,19 @@ namespace isomorphism::math {
         return t.get_impl()->data;
     }
 
+    static inline DType get_isomorphism_dtype(torch::ScalarType type) {
+        switch (type) {
+            case torch::kFloat64: return DType::Float64;
+            case torch::kFloat16: return DType::Float16;
+            case torch::kBFloat16: return DType::BFloat16;
+            case torch::kFloat32:
+            default:              return DType::Float32;
+        }
+    }
+
     static inline Tensor wrap(torch::Tensor t) {
-        return Tensor(std::make_shared<TensorImpl>(std::move(t)));
+        DType dt = get_isomorphism_dtype(t.scalar_type());
+        return Tensor(std::make_shared<TensorImpl>(std::move(t)), dt);
     }
 
     // ==============================================================================
@@ -86,6 +97,13 @@ namespace isomorphism::math {
         // from_blob doesn't own the data, so clone() immediately to take ownership.
         auto t = torch::from_blob(const_cast<float*>(data.data()), s, torch::kFloat32).clone();
         if (dtype != DType::Float32) t = t.to(get_torch_dtype(dtype));
+        return wrap(t.to(g_default_device));
+    }
+
+    Tensor array(const std::vector<double>& data, const std::vector<int>& shape, DType dtype) {
+        std::vector<int64_t> s(shape.begin(), shape.end());
+        auto t = torch::from_blob(const_cast<double*>(data.data()), s, torch::kFloat64).clone();
+        if (dtype != DType::Float64) t = t.to(get_torch_dtype(dtype));
         return wrap(t.to(g_default_device));
     }
 
@@ -312,6 +330,13 @@ namespace isomorphism::math {
         return wrap(vals.to(original_device));
     }
 
+    std::tuple<Tensor, Tensor> eigh(const Tensor& a) {
+        auto t = unwrap(a);
+        auto original_device = t.device();
+        auto [vals, vecs] = torch::linalg_eigh(t.to(torch::kCPU), "L");
+        return {wrap(vals.to(original_device)), wrap(vecs.to(original_device))};
+    }
+
     /*
     // Adaptive Padé matrix exponential — fully supported in PyTorch linalg.
     Tensor matrix_exp(const Tensor& a) {
@@ -531,12 +556,22 @@ namespace isomorphism::math {
         return std::vector<float>(ptr, ptr + t.numel());
     }
 
+    std::vector<double> to_double_vector(const Tensor& a) {
+        auto t = unwrap(a).to(torch::kCPU).to(torch::kFloat64).contiguous();
+        const double* ptr = t.data_ptr<double>();
+        return std::vector<double>(ptr, ptr + t.numel());
+    }
+
     int to_int(const Tensor& a) {
         return unwrap(a).to(torch::kCPU).item<int>();
     }
 
     void eval(const Tensor& /*a*/) {
         // PyTorch is eager — all operations are already evaluated.
+    }
+
+    void clear_backend_cache() {
+        // Eager allocator managed by libtorch — nothing to release here.
     }
 
     Tensor concatenate(const std::vector<Tensor>& tensors, int axis) {

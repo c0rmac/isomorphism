@@ -8,6 +8,10 @@ set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
+set(CMAKE_OBJCXX_STANDARD 20)
+set(CMAKE_OBJCXX_STANDARD_REQUIRED ON)
+set(CMAKE_OBJCXX_EXTENSIONS OFF)
+
 # Backend Selection Options — one or more may be enabled simultaneously.
 # Each produces its own library: libisomorphism_mlx, libisomorphism_eigen, etc.
 option(USE_MLX   "Build with Apple Silicon (Metal/MLX) backend" OFF)
@@ -95,61 +99,78 @@ endmacro()
 # --- Apple Silicon / MLX ---
 if (USE_MLX)
     message(STATUS "Isomorphism: Building MLX backend (Apple Silicon)")
-    enable_language(OBJCXX)
     find_package(MLX REQUIRED)
 
-    # --- QR_Unblocked.metallib (M > 512) ---
-    set(_qr_unblocked_metallib "${CMAKE_CURRENT_SOURCE_DIR}/qr_accelerated/QR_Unblocked.metallib")
-    if (NOT EXISTS "${_qr_unblocked_metallib}")
-        message(STATUS "Isomorphism: Compiling QR_Unblocked.metal → metallib")
-        execute_process(
-            COMMAND xcrun -sdk macosx metal -c
-                    "${CMAKE_CURRENT_SOURCE_DIR}/qr_accelerated/QR_Unblocked.metal"
-                    -o "${CMAKE_CURRENT_BINARY_DIR}/QR_Unblocked.air"
-            COMMAND_ERROR_IS_FATAL ANY
-        )
-        execute_process(
-            COMMAND xcrun -sdk macosx metallib
-                    "${CMAKE_CURRENT_BINARY_DIR}/QR_Unblocked.air"
-                    -o "${_qr_unblocked_metallib}"
-            COMMAND_ERROR_IS_FATAL ANY
-        )
-    endif ()
+    # QR, eigh and SVD on the GPU come from metal-linalg
+    # (https://github.com/c0rmac/metal-linalg). Nothing has to be installed by
+    # hand: CMake takes the first of
+    #
+    #   1. METAL_LINALG_SOURCE_DIR, if set: that checkout, built in from source;
+    #   2. a checkout beside this project (../metal-linalg), likewise;
+    #   3. an installed metal-linalg, e.g. from Homebrew;
+    #   4. otherwise metal-linalg is downloaded from METAL_LINALG_GIT_REPOSITORY
+    #      and built along with this project, automatically.
+    #
+    # Built in from source (1, 2, 4) it is a static library folded into
+    # libisomorphism_mlx, and its shaders and per-device routing tables are the
+    # checkout's. -DMETAL_LINALG_USE_INSTALLED=ON insists on 3, which is what
+    # the isomorphism-mlx formula does, since a Homebrew build has no network.
+    # Either way the library carries its own compiled shaders.
+    option(METAL_LINALG_USE_INSTALLED
+           "Use only an installed metal-linalg (find_package), never a source checkout or a download" OFF)
+    set(METAL_LINALG_SOURCE_DIR "" CACHE PATH
+        "metal-linalg checkout to build from source (empty: look beside this project)")
+    set(METAL_LINALG_GIT_REPOSITORY "https://github.com/c0rmac/metal-linalg.git" CACHE STRING
+        "Where to download metal-linalg from when no checkout or installed copy is found")
+    set(METAL_LINALG_GIT_TAG "main" CACHE STRING "Git tag or branch of metal-linalg to download")
 
-    # --- QR_Streaming_AMX.metallib (M <= 512) ---
-    set(_qr_streaming_amx_metallib "${CMAKE_CURRENT_SOURCE_DIR}/qr_accelerated/QR_Streaming_AMX.metallib")
-    if (NOT EXISTS "${_qr_streaming_amx_metallib}")
-        message(STATUS "Isomorphism: Compiling QR_Streaming_AMX.metal → metallib")
-        execute_process(
-            COMMAND xcrun -sdk macosx metal -c
-                    "${CMAKE_CURRENT_SOURCE_DIR}/qr_accelerated/QR_Streaming_AMX.metal"
-                    -o "${CMAKE_CURRENT_BINARY_DIR}/QR_Streaming_AMX.air"
-            COMMAND_ERROR_IS_FATAL ANY
-        )
-        execute_process(
-            COMMAND xcrun -sdk macosx metallib
-                    "${CMAKE_CURRENT_BINARY_DIR}/QR_Streaming_AMX.air"
-                    -o "${_qr_streaming_amx_metallib}"
-            COMMAND_ERROR_IS_FATAL ANY
-        )
+    set(_iso_metal_linalg_installed OFF)
+    if (METAL_LINALG_USE_INSTALLED)
+        find_package(MetalLinalg REQUIRED)
+        set(_iso_metal_linalg_installed ON)
+        set(_iso_metal_linalg_from "the installed package (${MetalLinalg_DIR})")
+    else ()
+        if (NOT METAL_LINALG_SOURCE_DIR
+            AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/../metal-linalg/include/metal_linalg/qr.h")
+            get_filename_component(METAL_LINALG_SOURCE_DIR
+                                   "${CMAKE_CURRENT_SOURCE_DIR}/../metal-linalg" ABSOLUTE)
+        endif ()
+        if (METAL_LINALG_SOURCE_DIR)
+            add_subdirectory("${METAL_LINALG_SOURCE_DIR}" "${CMAKE_CURRENT_BINARY_DIR}/metal-linalg")
+            set(_iso_metal_linalg_from "source at ${METAL_LINALG_SOURCE_DIR}")
+        else ()
+            find_package(MetalLinalg CONFIG QUIET)
+            if (MetalLinalg_FOUND)
+                set(_iso_metal_linalg_installed ON)
+                set(_iso_metal_linalg_from "the installed package (${MetalLinalg_DIR})")
+            else ()
+                include(FetchContent)
+                FetchContent_Declare(metal_linalg
+                    GIT_REPOSITORY "${METAL_LINALG_GIT_REPOSITORY}"
+                    GIT_TAG        "${METAL_LINALG_GIT_TAG}"
+                    GIT_SHALLOW    TRUE)
+                FetchContent_MakeAvailable(metal_linalg)
+                set(_iso_metal_linalg_from
+                    "${METAL_LINALG_GIT_REPOSITORY} (${METAL_LINALG_GIT_TAG}), downloaded and built in")
+            endif ()
+        endif ()
+    endif ()
+    message(STATUS "Isomorphism: metal-linalg from ${_iso_metal_linalg_from}")
+
+    if (TARGET metal_linalg)
+        # Built in from source: it still has to sit in the export set for a
+        # static isomorphism build to be installable.
+        install(TARGETS metal_linalg EXPORT IsomorphismTargets
+                ARCHIVE DESTINATION lib LIBRARY DESTINATION lib)
     endif ()
 
     isomorphism_add_backend(mlx USE_MLX
         src/backends/mlx/tensor_mlx.cpp
         src/backends/mlx/math_mlx.cpp
-        qr_accelerated/qr_unblocked.mm
-        qr_accelerated/qr_streaming_amx.mm
-        qr_accelerated/qr_dispatch.mm
-    )
-    target_include_directories(isomorphism_mlx PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
-    target_compile_definitions(isomorphism_mlx PRIVATE
-        "QR_UNBLOCKED_METALLIB_PATH=\"${_qr_unblocked_metallib}\""
-        "QR_STREAMING_AMX_METALLIB_PATH=\"${_qr_streaming_amx_metallib}\""
     )
     target_link_libraries(isomorphism_mlx PRIVATE
         mlx
-        "-framework Metal"
-        "-framework Foundation"
+        metal_linalg::metal_linalg
     )
 endif ()
 
@@ -276,6 +297,12 @@ include("${CMAKE_CURRENT_LIST_DIR}/IsomorphismTargets.cmake")
 ]=])
 file(APPEND "${CMAKE_CURRENT_BINARY_DIR}/isomorphismConfig.cmake"
     "set(isomorphism_DEFAULT_TARGET isomorphism::${_iso_default_backend})\n")
+if (USE_MLX AND _iso_metal_linalg_installed)
+    # isomorphism_mlx links the installed metal-linalg, so a consumer of this
+    # installation needs it found too (a static build references its target).
+    file(APPEND "${CMAKE_CURRENT_BINARY_DIR}/isomorphismConfig.cmake"
+        "include(CMakeFindDependencyMacro)\nfind_dependency(MetalLinalg)\n")
+endif ()
 
 install(FILES "${CMAKE_CURRENT_BINARY_DIR}/isomorphismConfig.cmake"
     DESTINATION lib/cmake/isomorphism

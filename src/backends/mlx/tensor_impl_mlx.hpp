@@ -21,6 +21,15 @@ namespace isomorphism {
         }
     }
 
+    // Translates mlx::core::Dtype back to isomorphism::DType
+    static inline DType from_mlx_dtype(mlx::core::Dtype dtype) {
+        if (dtype == mlx::core::float16)  return DType::Float16;
+        if (dtype == mlx::core::float64)  return DType::Float64;
+        if (dtype == mlx::core::bfloat16) return DType::BFloat16;
+        return DType::Float32;
+    }
+
+
     /**
      * @struct TensorImpl
      * @brief The hidden MLX implementation of our Tensor.

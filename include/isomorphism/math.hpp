@@ -201,6 +201,7 @@ namespace isomorphism::math {
 
     /** @brief Element-wise power function: a^exponent. */
     Tensor pow(const Tensor &a, float exponent);
+    Tensor pow(const Tensor &a, const Tensor &exponent);
 
     /** @brief Element-wise tangent function. */
     Tensor tan(const Tensor &a);
@@ -290,6 +291,22 @@ namespace isomorphism::math {
      */
     Tensor matrix_log(const Tensor &a);
 
+    /**
+     * @brief Stable principal matrix logarithm for SO(d) matrices.
+     *
+     * Computes log(R) for rotation matrices using the symmetric/antisymmetric split.
+     * This avoids the Denman-Beavers scaling-and-squaring divergence for large angles
+     * and relies only on the real symmetric eigenvalue decomposition (eigh) of the
+     * symmetric part S = (R + Rᵀ)/2. It handles repeated eigenvalues smoothly without
+     * requiring complex arithmetic or matrix inverses.
+     *
+     * @param R [..., d, d] tensor of proper rotation matrices.
+     * @param nan_on_fail If true, cut-locus matrices (180 degree rotations) will yield NaNs
+     *                    instead of being filled with zeros.
+     * @return [..., d, d] skew-symmetric tensor of the same dtype.
+     */
+    Tensor matrix_log_so(const Tensor &R, bool nan_on_fail = false);
+
     /** * @brief Creates a 2D diagonal matrix from a 1D tensor.
      * Given a vector v of length k, returns the k x k matrix with v on the main diagonal.
      */
@@ -365,6 +382,19 @@ namespace isomorphism::math {
 
     /** @brief Explicitly executes the pending computation graph for this tensor. */
     void eval(const Tensor &a);
+
+    /** @brief Explicitly executes the pending computation graphs for multiple tensors simultaneously. */
+    void eval(const std::vector<Tensor> &tensors);
+
+    /** * @brief Releases the backend allocator's buffer cache.
+     * MLX: the Metal buffer pool is UNBOUNDED by default and grows to the
+     * high-water mark of allocation traffic — long-running loops with large
+     * batched temporaries (e.g. per-refresh [n,d,d] matrix_log chains) will
+     * appear to "leak" resident memory even though every array is freed.
+     * Call this periodically (e.g. once per measurement refresh) in such
+     * loops. No-op on eager backends without a caching allocator.
+     */
+    void clear_backend_cache();
 
     /** @brief Concatenates a vector of tensors along a specified axis. */
     Tensor concatenate(const std::vector<Tensor> &tensors, int axis = 0);

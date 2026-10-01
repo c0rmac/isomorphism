@@ -400,6 +400,12 @@ Tensor array(const std::vector<float>& data, const std::vector<int>& shape, DTyp
     return Tensor(impl, DType::Float32);
 }
 
+Tensor array(const std::vector<double>& data, const std::vector<int>& shape, DType dtype) {
+    auto impl = std::make_shared<TensorImpl>(shape);
+    std::copy(data.begin(), data.end(), impl->data_ptr.get());
+    return Tensor(impl, DType::Float32);
+}
+
 Tensor full(const std::vector<int>& shape, float value, DType dtype) {
     auto impl = std::make_shared<TensorImpl>(shape);
     std::fill(impl->data_ptr.get(), impl->data_ptr.get() + impl->size(), value);
@@ -1076,6 +1082,70 @@ Tensor inv(const Tensor& a) {
     return Tensor(res_impl, DType::Float32);
 }
 
+Tensor matrix_log_so(const Tensor& a, bool nan_on_fail) {
+    const double fail_fill = nan_on_fail
+        ? std::numeric_limits<double>::quiet_NaN() : 0.0;
+
+    const bool  was_2d = (a.shape().size() == 2);
+    const int   d = a.shape().back();
+    const DType dt = a.dtype();
+    Tensor R = was_2d ? expand_dims(a, {0}) : a;
+    const int   N = R.shape()[0];
+
+    Tensor Rt = transpose(R, {0, 2, 1});
+    Tensor S  = multiply(add(R, Rt),      Tensor(0.5, dt));   // symmetric part
+    Tensor W  = multiply(subtract(R, Rt), Tensor(0.5, dt));   // skew part
+
+    auto eig = eigh(S);                          // vals [N,d] = cos θ_k ; vecs [N,d,d]
+    Tensor vals = std::get<0>(eig);
+    Tensor vecs = std::get<1>(eig);
+    std::vector<double> mu = to_double_vector(vals);
+
+    constexpr double cut_eps = 0.0;   // |μ+1| ≤ eps ⇒ θ within ~1.4e-3 of π: the cut locus
+    std::vector<double> gv(static_cast<size_t>(N) * d);
+    std::vector<double> badrow(static_cast<size_t>(N) * d * d, 0.0);
+    for (int n = 0; n < N; ++n) {
+        for (int k = 0; k < d; ++k) {
+            double m = std::min(1.0, std::max(-1.0, mu[static_cast<size_t>(n) * d + k]));
+            double th = std::acos(m);
+            // θ/sin θ, with the removable singularity at θ→0 handled by its Taylor tail.
+            gv[static_cast<size_t>(n) * d + k] =
+                (th < 1e-6) ? (1.0 + th * th / 6.0) : (th / std::sin(th));
+        }
+    }
+
+    // g(S) = V · diag(g(μ)) · Vᵀ
+    // then log R = g(S)·W.
+    Tensor gvals = array(gv, {N, d}, dt);
+    Tensor diagG = multiply(expand_dims(gvals, {2}),
+                            expand_dims(eye(d, dt), {0}));  // [N,d,d] diagonal
+    Tensor G = matmul(vecs, matmul(diagG, transpose(vecs, {0, 2, 1})));
+    Tensor L = matmul(G, W);
+    // Project away any O(ε) non-skew part from finite precision.
+    L = multiply(subtract(L, transpose(L, {0, 2, 1})), Tensor(0.5, dt));
+
+    // Clamp the Frobenius norm of L to pi * sqrt(d/2) to prevent cut-locus explosion aliases
+    Tensor L2 = multiply(L, L);
+    Tensor sq_norm = sum(L2, {1, 2}); // Assuming L is [N, d, d], so axes 1,2
+    auto old_shape = sq_norm.shape();
+    std::vector<int> new_shape = old_shape;
+    new_shape.push_back(1);
+    new_shape.push_back(1);
+    sq_norm = reshape(sq_norm, new_shape);
+    Tensor norm = sqrt(sq_norm);
+    
+    float max_norm_val = M_PI * std::sqrt(d / 2.0f);
+    Tensor max_norm = array(std::vector<double>{max_norm_val}, {1, 1, 1}, dt);
+    
+    Tensor over_mask = greater(norm, max_norm);
+    Tensor scale = divide(max_norm, add(norm, Tensor(1e-12, dt)));
+    Tensor L_scaled = multiply(L, scale);
+    
+    L = where(over_mask, L_scaled, L);
+
+    return was_2d ? squeeze(L, {0}) : L;
+}
+
 Tensor diag_embed(const Tensor& v) {
     Tensor cv = contiguous(v);
     int k = cv.shape().back();
@@ -1194,9 +1264,23 @@ std::vector<float> to_float_vector(const Tensor &a) {
     return v;
 }
 
+std::vector<double> to_double_vector(const Tensor &a) {
+    Tensor ca = contiguous(a);
+    auto& impl = unwrap(ca);
+    std::vector<double> v(impl.size());
+    for (size_t i = 0; i < impl.size(); ++i) {
+        v[i] = static_cast<double>(impl.data_ptr[i]);
+    }
+    return v;
+}
+
 void eval(const Tensor &a) {
     // The Eigen backend is eager; all math is evaluated during the 'wrap' call
     // No asynchronous graph or pending computation exists to synchronize.
+}
+
+void clear_backend_cache() {
+    // Eager backend, no caching allocator — nothing to release.
 }
 
 Tensor concatenate(const std::vector<Tensor> &tensors, int axis) {
@@ -1281,6 +1365,42 @@ Tensor eigvalsh(const Tensor& a) {
         }
     }
     return Tensor(impl, DType::Float32);
+}
+
+std::tuple<Tensor, Tensor> eigh(const Tensor& a) {
+    Tensor ca  = contiguous(a);
+    int    d   = ca.shape().back();
+    int    bat = ca.size() / (d * d);
+
+    // Output shape for eigenvalues: drop the last dimension → [..., d].
+    auto shape_vals = ca.shape();
+    shape_vals.pop_back();
+    auto impl_vals = std::make_shared<TensorImpl>(shape_vals);
+
+    // Output shape for eigenvectors: same as input shape → [..., d, d].
+    auto shape_vecs = ca.shape();
+    auto impl_vecs = std::make_shared<TensorImpl>(shape_vecs);
+
+    const float* pA   = unwrap(ca).data_ptr.get();
+    float*       pVals = impl_vals->data_ptr.get();
+    float*       pVecs = impl_vecs->data_ptr.get();
+
+    #pragma omp parallel if(bat > 1)
+    {
+        // Hoist solver workspace: one allocation per thread.
+        Eigen::SelfAdjointEigenSolver<Mat> solver(d);
+
+        #pragma omp for schedule(static)
+        for (int i = 0; i < bat; ++i) {
+            Eigen::Map<const Mat> mapA(pA + i * d * d, d, d);
+            Eigen::Map<Vec>       mapV(pVals + i * d, d);
+            Eigen::Map<Mat>       mapVecs(pVecs + i * d * d, d, d);
+            solver.compute(mapA, Eigen::ComputeEigenvectors);
+            mapV = solver.eigenvalues();
+            mapVecs = solver.eigenvectors();
+        }
+    }
+    return {Tensor(impl_vals, DType::Float32), Tensor(impl_vecs, DType::Float32)};
 }
 
 void set_default_device_cpu() {

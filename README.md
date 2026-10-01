@@ -18,6 +18,10 @@ brew tap c0rmac/homebrew-isomorphism
 ```bash
 brew install isomorphism-mlx
 ```
+`qr`, `eigh` and `svd` run on the GPU through
+[metal-linalg](https://github.com/c0rmac/metal-linalg)
+(`c0rmac/metal-linalg/metal-linalg`, pulled in as a dependency), which routes
+each shape to its Metal kernels or to the CPU by a policy measured per device.
 
 **Eigen** — lightweight CPU-only, no large framework dependency:
 ```bash
@@ -40,6 +44,24 @@ cmake -S . -B build -DUSE_MLX=ON -DCMAKE_BUILD_TYPE=Release   # or USE_EIGEN / U
 cmake --build build
 cmake --install build
 ```
+
+**MLX backend** — needs `mlx` (`brew install mlx`; pass
+`-DCMAKE_PREFIX_PATH=/opt/homebrew` if CMake does not find it) and
+[metal-linalg](https://github.com/c0rmac/metal-linalg), which needs no separate
+install step. CMake takes the first of:
+
+1. `-DMETAL_LINALG_SOURCE_DIR=/path/to/metal-linalg`, built in from source;
+2. a metal-linalg checkout in the same parent folder as this project
+   (`../metal-linalg`), built in from source, so that its shaders and
+   per-device routing tables are the checkout's;
+3. an installed metal-linalg, e.g. from Homebrew
+   (`brew tap c0rmac/metal-linalg`, then `brew install --HEAD metal-linalg`);
+4. otherwise metal-linalg is downloaded from GitHub (`METAL_LINALG_GIT_REPOSITORY`
+   at `METAL_LINALG_GIT_TAG`, default `main`) and built in, automatically.
+
+The configure step says which it used (`Isomorphism: metal-linalg from ...`).
+`-DMETAL_LINALG_USE_INSTALLED=ON` insists on an installed copy, which is what
+the `isomorphism-mlx` formula does, since a Homebrew build has no network.
 
 **PyTorch backend** — point CMake at your LibTorch installation:
 ```bash

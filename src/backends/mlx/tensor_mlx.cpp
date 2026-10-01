@@ -50,7 +50,11 @@ Tensor::Tensor(double scalar_value, DType dtype) : dtype_(dtype) {
     // Map our DType to MLX's internal type system via our local helper
     mlx::core::Dtype mlx_type = to_mlx_dtype(dtype);
     // Create the MLX array and wrap it in the Pimpl container
-    pimpl_ = std::make_shared<TensorImpl>(mlx::core::array(static_cast<float>(scalar_value), mlx_type));
+    if (mlx_type == mlx::core::float64) {
+        pimpl_ = std::make_shared<TensorImpl>(mlx::core::array(scalar_value, mlx_type));
+    } else {
+        pimpl_ = std::make_shared<TensorImpl>(mlx::core::array(static_cast<float>(scalar_value), mlx_type));
+    }
 }
 
 /**
@@ -97,31 +101,26 @@ int Tensor::size() const {
 /**
  * @brief Recursively prints N-dimensional tensor data with appropriate bracket nesting.
  */
-static void print_recursive(std::ostream& os, const float* data, const std::vector<int>& shape,
+template <typename T>
+static void print_recursive(std::ostream& os, const T* data, const std::vector<int>& shape,
                             int depth, size_t offset, const std::vector<size_t>& strides) {
-    // Base case 1: 0D Tensor (Scalar)
     if (shape.empty()) {
-        os << data[0];
+        os << std::setprecision(10) << data[0];
         return;
     }
 
-    // Base case 2: Innermost dimension (Print actual values)
     if (depth == static_cast<int>(shape.size()) - 1) {
         os << "[";
         for (int i = 0; i < shape[depth]; ++i) {
-            os << std::setprecision(6) << data[offset + i * strides[depth]];
+            os << std::setprecision(10) << data[offset + i * strides[depth]];
             if (i < shape[depth] - 1) os << ", ";
         }
         os << "]";
-    }
-    // Recursive case: Outer dimensions (Print brackets and recurse)
-    else {
+    } else {
         os << "[";
         for (int i = 0; i < shape[depth]; ++i) {
             if (i > 0) {
-                os << ",\n";
-                // Add indentation based on depth for readability
-                os << std::string(depth + 1, ' ');
+                os << ",\n" << std::string(depth + 1, ' ');
             }
             print_recursive(os, data, shape, depth + 1, offset + i * strides[depth], strides);
         }
@@ -129,35 +128,23 @@ static void print_recursive(std::ostream& os, const float* data, const std::vect
     }
 }
 
-    /**
-     * @brief Overload for standard output streams to print the underlying tensor data.
-     */
-    std::ostream& operator<<(std::ostream& os, const Tensor& tensor) {
+std::ostream& operator<<(std::ostream& os, const Tensor& tensor) {
     auto impl = tensor.get_impl();
     if (!impl) {
         return os << "Tensor(Null)";
     }
 
-    // --- FIX: Force Contiguous Memory ---
-    // Make a copy of the MLX array
     mlx::core::array arr = impl->data;
-
-    // Multiplying by 1.0 allocates a fresh, densely-packed memory buffer,
-    // which eliminates any complex strides left over from math::slice.
     arr = mlx::core::multiply(arr, mlx::core::array(1.0f, arr.dtype()));
 
-    // Ensure it's Float32 for our raw C++ pointer cast below
-    if (arr.dtype() != mlx::core::float32) {
+    bool is_double = (arr.dtype() == mlx::core::float64);
+    if (!is_double && arr.dtype() != mlx::core::float32) {
         arr = mlx::core::astype(arr, mlx::core::float32);
     }
 
-    // Force the Apple GPU to execute the graph and sync memory
     mlx::core::eval({arr});
 
-    // 2. Extract shape
     auto shape = tensor.shape();
-
-    // 3. Compute flat memory strides (now safe because we forced contiguous memory above)
     std::vector<size_t> strides(shape.size(), 1);
     if (!shape.empty()) {
         for (int i = static_cast<int>(shape.size()) - 2; i >= 0; --i) {
@@ -165,18 +152,17 @@ static void print_recursive(std::ostream& os, const float* data, const std::vect
         }
     }
 
-    // 4. Safely grab the raw float pointer from our new contiguous MLX array
-    const float* ptr = arr.data<float>();
-
-    // 5. Print the header
     os << "Tensor(shape={";
     for (size_t i = 0; i < shape.size(); ++i) {
         os << shape[i] << (i == static_cast<size_t>(shape.size()) - 1 ? "" : ", ");
     }
     os << "}, data=\n";
 
-    // 6. Trigger recursive printing
-    print_recursive(os, ptr, shape, 0, 0, strides);
+    if (is_double) {
+        print_recursive(os, arr.data<double>(), shape, 0, 0, strides);
+    } else {
+        print_recursive(os, arr.data<float>(), shape, 0, 0, strides);
+    }
 
     os << "\n)";
     return os;
