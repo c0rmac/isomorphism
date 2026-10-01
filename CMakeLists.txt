@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.25)
-project(isomorphism VERSION 1.0.0 LANGUAGES CXX)
+project(isomorphism VERSION 1.1.0 LANGUAGES CXX)
 
 # ==============================================================================
 # 1. Global C++ Standards & Project Configuration

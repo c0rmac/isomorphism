@@ -12,6 +12,7 @@ Each backend is a separate formula. Add the tap once, then install the formula t
 
 ```bash
 brew tap c0rmac/homebrew-isomorphism
+brew trust c0rmac/isomorphism          # Homebrew 7 and later ask this of any third-party tap
 ```
 
 **Apple MLX** — recommended on Apple Silicon (M1/M2/M3/M4), uses the Metal GPU:
@@ -22,6 +23,7 @@ brew install isomorphism-mlx
 [metal-linalg](https://github.com/c0rmac/metal-linalg)
 (`c0rmac/metal-linalg/metal-linalg`, pulled in as a dependency), which routes
 each shape to its Metal kernels or to the CPU by a policy measured per device.
+Its tap has to be trusted too: `brew trust c0rmac/metal-linalg`.
 
 **Eigen** — lightweight CPU-only, no large framework dependency:
 ```bash
@@ -55,7 +57,8 @@ install step. CMake takes the first of:
    (`../metal-linalg`), built in from source, so that its shaders and
    per-device routing tables are the checkout's;
 3. an installed metal-linalg, e.g. from Homebrew
-   (`brew tap c0rmac/metal-linalg`, then `brew install --HEAD metal-linalg`);
+   (`brew tap c0rmac/metal-linalg`, `brew trust c0rmac/metal-linalg`, then
+   `brew install metal-linalg`);
 4. otherwise metal-linalg is downloaded from GitHub (`METAL_LINALG_GIT_REPOSITORY`
    at `METAL_LINALG_GIT_TAG`, default `main`) and built in, automatically.
 
@@ -321,6 +324,26 @@ src/backends/
     torch/              # PyTorch (LibTorch)
     sycl/               # PC GPU (SYCL / oneMKL) — in progress
 ```
+
+---
+
+## Releases
+
+Releases are automatic. Every update to `main` that changes the library
+(anything beyond Markdown files and `.github/`) makes the
+[Release](.github/workflows/release.yml) workflow publish the next version: a
+`vX.Y.Z` tag, a GitHub release with its source tarball, and every formula in
+[c0rmac/homebrew-isomorphism](https://github.com/c0rmac/homebrew-isomorphism)
+pointed at it. The version in `CMakeLists.txt`'s `project()` is released as it
+is if it has no tag yet; otherwise the patch number goes up by one and the
+workflow commits it. To start a minor or major version, set it there by hand.
+
+Updating the tap needs a token that can push to it, kept in this repository as
+the secret `HOMEBREW_TAP_TOKEN`: a fine-grained personal access token with
+access to the tap repository only and the permission **Contents: Read and
+write**, stored with `gh secret set HOMEBREW_TAP_TOKEN --repo c0rmac/isomorphism`.
+Without it, releases are still made, and each run's summary gives the formula
+lines to change by hand.
 
 ---
 
