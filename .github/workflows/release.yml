@@ -17,6 +17,11 @@ on:
   push:
     branches: [main]
   workflow_dispatch:
+    inputs:
+      tap_version:
+        description: "Only point the Homebrew tap at this existing release (e.g. 2.0.1), to retry a failed tap update"
+        required: false
+        default: ""
 
 permissions:
   contents: write
@@ -27,6 +32,7 @@ concurrency:
 
 jobs:
   release:
+    if: github.event_name != 'workflow_dispatch' || inputs.tap_version == ''
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -71,3 +77,14 @@ jobs:
         env:
           HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
         run: python3 .github/release.py tap "${{ steps.plan.outputs.version }}" c0rmac/homebrew-isomorphism
+
+  tap:
+    # Retries the last step for a release that already exists.
+    if: github.event_name == 'workflow_dispatch' && inputs.tap_version != ''
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Point the Homebrew formulas at it
+        env:
+          HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+        run: python3 .github/release.py tap "${{ inputs.tap_version }}" c0rmac/homebrew-isomorphism
