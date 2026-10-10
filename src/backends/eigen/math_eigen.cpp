@@ -9,10 +9,12 @@
 #include <Eigen/SVD>
 #include <Eigen/QR>
 #include <Eigen/LU>
+#include <Eigen/Cholesky>
 #include <unsupported/Eigen/MatrixFunctions>
 #include <unsupported/Eigen/FFT>
 #include <unsupported/Eigen/CXX11/Tensor>
 
+#include <limits>
 #include <random>
 #include <stdexcept>
 #include <thread>
@@ -804,25 +806,60 @@ Tensor irfft(const Tensor& a, int n, int axis) {
 using Mat = Eigen::Matrix<float, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>;
 using Vec = Eigen::VectorXf;
 
+// a [..., n, n] and b as matrices [..., n, k], broadcast to one batch shape
+// and contiguous. b [..., n] is a batch of vectors when it is 1-D or has a's
+// shape without its last axis (torch.linalg.solve's rule); the result then
+// has b's shape without the k axis.
+struct BatchedRhs {
+    Tensor a, b;
+    std::vector<int> out_shape;
+    int n, k, batch;
+};
+static BatchedRhs batch_rhs(const Tensor& a, const Tensor& b, const char* who) {
+    const std::vector<int> sa = a.shape();
+    std::vector<int> sb = b.shape();
+    if (sa.size() < 2 || sa.back() != sa[sa.size() - 2])
+        throw std::invalid_argument(std::string("[isomorphism/eigen] ") + who + " needs a [..., n, n] matrix.");
+    const int n = sa.back();
+    const bool vector = sb.size() == 1 || sb == std::vector<int>(sa.begin(), sa.end() - 1);
+    if (vector) sb.push_back(1);
+    if (sb.size() < 2 || sb[sb.size() - 2] != n)
+        throw std::invalid_argument(std::string("[isomorphism/eigen] ") + who + ": b must be [..., n, k] or [..., n].");
+    const int k = sb.back();
+
+    std::vector<int> batch(std::max(sa.size(), sb.size()) - 2, 1);
+    for (size_t i = 0; i < batch.size(); ++i) {
+        const int ia = (int)sa.size() - 3 - (int)i, ib = (int)sb.size() - 3 - (int)i;
+        const int ea = ia >= 0 ? sa[ia] : 1, eb = ib >= 0 ? sb[ib] : 1;
+        if (ea != eb && ea != 1 && eb != 1)
+            throw std::invalid_argument(std::string("[isomorphism/eigen] ") + who + ": batch shapes do not broadcast.");
+        batch[batch.size() - 1 - i] = std::max(ea, eb);
+    }
+    std::vector<int> full_a = batch, full_b = batch;
+    full_a.insert(full_a.end(), {n, n});
+    full_b.insert(full_b.end(), {n, k});
+    BatchedRhs r{contiguous(broadcast_to(a, full_a)), contiguous(broadcast_to(reshape(b, sb), full_b)), full_b, n, k, 1};
+    if (vector) r.out_shape.pop_back();
+    for (int e : batch) r.batch *= e;
+    return r;
+}
+
 Tensor solve(const Tensor& a, const Tensor& b) {
-    // solvers require contiguous memory for efficient LU mapping
-    Tensor ca = contiguous(a);
-    Tensor cb = contiguous(b);
+    BatchedRhs r = batch_rhs(a, b, "solve");
+    const int d = r.n, k = r.k;
+    const int bat = (d && k) ? r.batch : 0;
 
-    int d = ca.shape().back();
-    int k = cb.shape().back();
-    int bat = ca.size() / (d * d);
-
-    auto res_impl = std::make_shared<TensorImpl>(cb.shape());
-    float* pA = unwrap(ca).data_ptr.get();
-    float* pB = unwrap(cb).data_ptr.get();
+    auto res_impl = std::make_shared<TensorImpl>(r.out_shape);
+    // A view's data starts at its offset (contiguous() keeps a contiguous view).
+    const float* pA = unwrap(r.a).data_ptr.get() + unwrap(r.a).offset;
+    const float* pB = unwrap(r.b).data_ptr.get() + unwrap(r.b).offset;
     float* pX = res_impl->data_ptr.get();
 
     #pragma omp parallel for schedule(static)
     for (int i = 0; i < bat; ++i) {
-        Eigen::Map<const Mat> mapA(pA + i * d * d, d, d);
-        Eigen::Map<const Mat> mapB(pB + i * d * k, d, k);
-        Eigen::Map<Mat> mapX(pX + i * d * k, d, k);
+        Eigen::Map<const Mat> mapA(pA + (size_t)i * d * d, d, d);
+        Eigen::Map<const Mat> mapB(pB + (size_t)i * d * k, d, k);
+        Eigen::Map<Mat> mapX(pX + (size_t)i * d * k, d, k);
 
         // Use partial pivoting LU for stable general-purpose solving
         mapX = mapA.partialPivLu().solve(mapB);
@@ -1078,6 +1115,58 @@ Tensor inv(const Tensor& a) {
     for (int i = 0; i < bat; ++i) {
         Eigen::Map<const Mat> mapA(unwrap(ca).data_ptr.get() + i * d * d, d, d);
         Eigen::Map<Mat>(res_impl->data_ptr.get() + i * d * d, d, d) = mapA.inverse();
+    }
+    return Tensor(res_impl, DType::Float32);
+}
+
+Tensor cholesky(const Tensor& a, bool upper) {
+    Tensor ca = contiguous(a);
+    const int d = ca.shape().back();
+    const int bat = d ? ca.size() / (d * d) : 0;
+    auto res_impl = std::make_shared<TensorImpl>(ca.shape());
+    const float* pA = unwrap(ca).data_ptr.get() + unwrap(ca).offset;
+    float* pL = res_impl->data_ptr.get();
+
+    // One triangle is read and the other written as zeros; a matrix that is
+    // not positive definite becomes NaN.
+    #pragma omp parallel for schedule(static)
+    for (int i = 0; i < bat; ++i) {
+        Eigen::Map<const Mat> mapA(pA + (size_t)i * d * d, d, d);
+        Eigen::Map<Mat> mapL(pL + (size_t)i * d * d, d, d);
+        bool ok;
+        if (upper) {
+            Eigen::LLT<Mat, Eigen::Upper> llt(mapA);
+            ok = llt.info() == Eigen::Success;
+            if (ok) mapL = llt.matrixU();
+        } else {
+            Eigen::LLT<Mat, Eigen::Lower> llt(mapA);
+            ok = llt.info() == Eigen::Success;
+            if (ok) mapL = llt.matrixL();
+        }
+        if (!ok) mapL.setConstant(std::numeric_limits<float>::quiet_NaN());
+    }
+    return Tensor(res_impl, DType::Float32);
+}
+
+Tensor solve_triangular(const Tensor& a, const Tensor& b, bool upper, bool unit_diagonal) {
+    BatchedRhs r = batch_rhs(a, b, "solve_triangular");
+    const int d = r.n, k = r.k;
+    const int bat = (d && k) ? r.batch : 0;
+    auto res_impl = std::make_shared<TensorImpl>(r.out_shape);
+    // A view's data starts at its offset (contiguous() keeps a contiguous view).
+    const float* pA = unwrap(r.a).data_ptr.get() + unwrap(r.a).offset;
+    const float* pB = unwrap(r.b).data_ptr.get() + unwrap(r.b).offset;
+    float* pX = res_impl->data_ptr.get();
+
+    #pragma omp parallel for schedule(static)
+    for (int i = 0; i < bat; ++i) {
+        Eigen::Map<const Mat> mapA(pA + (size_t)i * d * d, d, d);
+        Eigen::Map<Mat> mapX(pX + (size_t)i * d * k, d, k);
+        mapX = Eigen::Map<const Mat>(pB + (size_t)i * d * k, d, k);
+        if (upper && unit_diagonal) mapA.triangularView<Eigen::UnitUpper>().solveInPlace(mapX);
+        else if (upper)             mapA.triangularView<Eigen::Upper>().solveInPlace(mapX);
+        else if (unit_diagonal)     mapA.triangularView<Eigen::UnitLower>().solveInPlace(mapX);
+        else                        mapA.triangularView<Eigen::Lower>().solveInPlace(mapX);
     }
     return Tensor(res_impl, DType::Float32);
 }

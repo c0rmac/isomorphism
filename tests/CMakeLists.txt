@@ -5,6 +5,8 @@ endfunction()
 
 # Register test executables here:
 add_sampler_test(test_basic)
+add_sampler_test(test_linalg)
+add_test(NAME test_linalg COMMAND test_linalg)
 add_sampler_test(test_qr)
 add_sampler_test(test_qr1)
 add_sampler_test(test_matrix_log_so)

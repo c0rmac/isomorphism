@@ -4,6 +4,9 @@
 #include "tensor_impl_torch.hpp"
 #include <torch/torch.h>
 
+#include <limits>
+#include <vector>
+
 namespace isomorphism::math {
 
     // Active device for all tensor-creating operations (eye, full, random_*, array).
@@ -242,50 +245,38 @@ namespace isomorphism::math {
     // 5. HEAVY LINEAR ALGEBRA
     // ==============================================================================
 
-    // Richardson iteration solver (Mirroring MLX's custom GPU implementation)
-    static torch::Tensor custom_gpu_solve_impl(const torch::Tensor& a, const torch::Tensor& b,
-                                              int max_iters = 15, float tol = 1e-5f) {
-        // 1. Dynamic Norm and Omega Calculation
-        auto abs_a = torch::abs(a);
-        auto row_sums = torch::sum(abs_a, /*dim=*/-1, /*keepdim=*/true);
-        // torch::max returns a tuple of {values, indices}
-        auto norm_a = std::get<0>(torch::max(row_sums, /*dim=*/-2, /*keepdim=*/true));
-
-        auto epsilon = torch::full({}, 1e-7f, a.options());
-        auto safe_norm = torch::maximum(norm_a, epsilon);
-        auto omega = 1.0f / safe_norm;
-
-        // 2. Initial State
-        torch::Tensor x = omega * b;
-        torch::Tensor residual = b - torch::matmul(a, x);
-
-        const int check_interval = 5;
-        for (int i = 0; i < max_iters; i += check_interval) {
-            for (int j = 0; j < check_interval && (i + j) < max_iters; ++j) {
-                // Update rule: X_{k+1} = X_k + omega * residual
-                x = x + (omega * residual);
-                residual = b - torch::matmul(a, x);
-            }
-
-            // item() triggers a synchronization point to check convergence
-            if (torch::max(torch::abs(residual)).item<float>() < tol) {
-                break;
-            }
+    // torch.linalg.solve on the tensors' device, or on the CPU (the result moved
+    // back) where that device has no kernel for it.
+    static torch::Tensor linalg_solve_anywhere(const torch::Tensor& a, const torch::Tensor& b) {
+        try {
+            return torch::linalg_solve(a, b);
+        } catch (const c10::Error&) {
+            if (a.device().is_cpu()) throw;
+            return torch::linalg_solve(a.cpu(), b.cpu()).to(a.device());
         }
-        return x;
     }
 
+    // b as matrices [..., n, k] against a [..., n, n], both expanded to one
+    // batch shape (torch's MPS kernels get a broadcast batch wrong, 2.13). b
+    // [..., n] is a batch of vectors when it is 1-D or has a's shape without
+    // its last axis, as torch.linalg.solve has it; `vector` says so.
+    static std::pair<torch::Tensor, torch::Tensor> batch_rhs(torch::Tensor a, torch::Tensor b, bool& vector) {
+        vector = b.dim() == 1 || b.sizes() == a.sizes().slice(0, a.dim() - 1);
+        if (vector) b = b.unsqueeze(-1);
+        auto batch = at::infer_size(a.sizes().slice(0, a.dim() - 2), b.sizes().slice(0, b.dim() - 2));
+        std::vector<int64_t> sa(batch), sb(batch);
+        sa.insert(sa.end(), {a.size(-2), a.size(-1)});
+        sb.insert(sb.end(), {b.size(-2), b.size(-1)});
+        return {a.expand(sa).contiguous(), b.expand(sb).contiguous()};
+    }
+
+    // LU with partial pivoting on every device (torch.linalg.solve, MPS included
+    // since torch 2.x).
     Tensor solve(const Tensor& a, const Tensor& b) {
-        auto t_a = unwrap(a);
-        auto t_b = unwrap(b);
-
-        // If running on a GPU device (CUDA or Apple MPS), use the iterative solver
-        if (t_a.is_cuda() || t_a.is_mps()) {
-            return wrap(custom_gpu_solve_impl(t_a, t_b));
-        }
-
-        // Otherwise, use native CPU LAPACK
-        return wrap(torch::linalg_solve(t_a, t_b));
+        bool vector = false;
+        auto [t_a, t_b] = batch_rhs(unwrap(a), unwrap(b), vector);
+        auto x = linalg_solve_anywhere(t_a, t_b);
+        return wrap(vector ? x.squeeze(-1) : x);
     }
 
     std::tuple<Tensor, Tensor, Tensor> svd(const Tensor& a) {
@@ -314,12 +305,41 @@ namespace isomorphism::math {
     }
 
     // PyTorch handles batched determinants natively — no custom Gaussian elimination needed.
+    // On MPS, from its LU: torch's MPS det gives NaN for some sizes (2.13: n = 512
+    // and 1536) where its LU of the same matrix is sound.
     Tensor det(const Tensor& a) {
-        return wrap(torch::linalg_det(unwrap(a)));
+        auto t = unwrap(a);
+        if (!t.is_mps() || t.dim() < 2 || t.size(-1) == 0) return wrap(torch::linalg_det(t));
+        // The product as exp(sum log|u_ii|) with the signs counted apart: a
+        // float32 product can overflow and underflow on the way to a
+        // determinant it can hold.
+        auto [lu, pivots, info] = torch::linalg_lu_factor_ex(t);
+        const int64_t n = t.size(-1);
+        auto u = lu.diagonal(0, -2, -1);
+        auto flips = pivots.ne(torch::arange(1, n + 1, pivots.options())).sum(-1) + u.lt(0).sum(-1);
+        auto d = u.abs().log().sum(-1).exp();
+        d = torch::where(flips.remainder(2).eq(1), -d, d);
+        return wrap(torch::where(info.gt(0), torch::zeros_like(d), d));   // an exactly zero pivot: singular
     }
 
     Tensor inv(const Tensor& a) {
         return wrap(torch::linalg_inv(unwrap(a)));
+    }
+
+    // A matrix that is not positive definite becomes NaN rather than throwing,
+    // as on the other backends.
+    Tensor cholesky(const Tensor& a, bool upper) {
+        auto [L, info] = torch::linalg_cholesky_ex(unwrap(a), upper);
+        auto failed = info.ne(0).unsqueeze(-1).unsqueeze(-1);
+        return wrap(torch::where(failed, torch::full({}, std::numeric_limits<double>::quiet_NaN(), L.options()), L));
+    }
+
+    // b [..., n, k] or [..., n], as for solve (torch's own takes matrices only).
+    Tensor solve_triangular(const Tensor& a, const Tensor& b, bool upper, bool unit_diagonal) {
+        bool vector = false;
+        auto [t_a, t_b] = batch_rhs(unwrap(a), unwrap(b), vector);
+        auto x = torch::linalg_solve_triangular(t_a, t_b, upper, /*left=*/true, unit_diagonal);
+        return wrap(vector ? x.squeeze(-1) : x);
     }
 
     Tensor eigvalsh(const Tensor& a) {

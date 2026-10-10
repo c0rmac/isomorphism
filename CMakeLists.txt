@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.25)
-project(isomorphism VERSION 1.1.1 LANGUAGES CXX)
+project(isomorphism VERSION 1.2.0 LANGUAGES CXX)
 
 # ==============================================================================
 # 1. Global C++ Standards & Project Configuration
@@ -101,13 +101,15 @@ if (USE_MLX)
     message(STATUS "Isomorphism: Building MLX backend (Apple Silicon)")
     find_package(MLX REQUIRED)
 
-    # QR, eigh and SVD on the GPU come from metal-linalg
+    # QR, eigh, the SVD, Cholesky, LU (solve, inv, det) and the triangular
+    # solve on the GPU come from metal-linalg 2.18 or later
     # (https://github.com/c0rmac/metal-linalg). Nothing has to be installed by
     # hand: CMake takes the first of
     #
     #   1. METAL_LINALG_SOURCE_DIR, if set: that checkout, built in from source;
-    #   2. a checkout beside this project (../metal-linalg), likewise;
-    #   3. an installed metal-linalg, e.g. from Homebrew;
+    #   2. a checkout beside this project (../metal-linalg) that is 2.18 or
+    #      later, likewise;
+    #   3. an installed metal-linalg 2.18 or later, e.g. from Homebrew;
     #   4. otherwise metal-linalg is downloaded from METAL_LINALG_GIT_REPOSITORY
     #      and built along with this project, automatically.
     #
@@ -126,12 +128,12 @@ if (USE_MLX)
 
     set(_iso_metal_linalg_installed OFF)
     if (METAL_LINALG_USE_INSTALLED)
-        find_package(MetalLinalg REQUIRED)
+        find_package(MetalLinalg 2.18 REQUIRED)
         set(_iso_metal_linalg_installed ON)
         set(_iso_metal_linalg_from "the installed package (${MetalLinalg_DIR})")
     else ()
         if (NOT METAL_LINALG_SOURCE_DIR
-            AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/../metal-linalg/include/metal_linalg/qr.h")
+            AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/../metal-linalg/include/metal_linalg/triangular.h")
             get_filename_component(METAL_LINALG_SOURCE_DIR
                                    "${CMAKE_CURRENT_SOURCE_DIR}/../metal-linalg" ABSOLUTE)
         endif ()
@@ -139,7 +141,7 @@ if (USE_MLX)
             add_subdirectory("${METAL_LINALG_SOURCE_DIR}" "${CMAKE_CURRENT_BINARY_DIR}/metal-linalg")
             set(_iso_metal_linalg_from "source at ${METAL_LINALG_SOURCE_DIR}")
         else ()
-            find_package(MetalLinalg CONFIG QUIET)
+            find_package(MetalLinalg 2.18 CONFIG QUIET)
             if (MetalLinalg_FOUND)
                 set(_iso_metal_linalg_installed ON)
                 set(_iso_metal_linalg_from "the installed package (${MetalLinalg_DIR})")

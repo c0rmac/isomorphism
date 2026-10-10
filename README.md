@@ -19,8 +19,9 @@ brew trust c0rmac/isomorphism          # Homebrew 7 and later ask this of any th
 ```bash
 brew install isomorphism-mlx
 ```
-`qr`, `eigh` and `svd` run on the GPU through
-[metal-linalg](https://github.com/c0rmac/metal-linalg)
+`qr`, `eigh`, `svd`, `cholesky`, `solve`, `inv`, `det` and
+`solve_triangular` run on the GPU through
+[metal-linalg](https://github.com/c0rmac/metal-linalg) (2.18 or later)
 (`c0rmac/metal-linalg/metal-linalg`, pulled in as a dependency), which routes
 each shape to its Metal kernels or to the CPU by a policy measured per device.
 Its tap has to be trusted too: `brew trust c0rmac/metal-linalg`.
@@ -53,10 +54,10 @@ cmake --install build
 install step. CMake takes the first of:
 
 1. `-DMETAL_LINALG_SOURCE_DIR=/path/to/metal-linalg`, built in from source;
-2. a metal-linalg checkout in the same parent folder as this project
-   (`../metal-linalg`), built in from source, so that its shaders and
-   per-device routing tables are the checkout's;
-3. an installed metal-linalg, e.g. from Homebrew
+2. a metal-linalg checkout (2.18 or later) in the same parent folder as
+   this project (`../metal-linalg`), built in from source, so that its
+   shaders and per-device routing tables are the checkout's;
+3. an installed metal-linalg 2.18 or later, e.g. from Homebrew
    (`brew tap c0rmac/metal-linalg`, `brew trust c0rmac/metal-linalg`, then
    `brew install metal-linalg`);
 4. otherwise metal-linalg is downloaded from GitHub (`METAL_LINALG_GIT_REPOSITORY`
@@ -146,7 +147,9 @@ math::gather(a, indices, axis)
 ### Linear algebra
 ```cpp
 math::matmul(a, b)                    // batched matrix multiply
-math::solve(A, b)                     // AX = B
+math::solve(A, b)                     // AX = B (LU); b [..., n, k] or [..., n]
+math::cholesky(A)                     // A = L Lᵀ; cholesky(A, true): A = Uᵀ U
+math::solve_triangular(L, b)          // L X = B; (U, b, true) for upper, unit_diagonal 4th
 auto [U, S, Vh] = math::svd(a)        // singular value decomposition
 auto [Q, R]     = math::qr(a)         // QR decomposition
 math::inv(a)                          // matrix inverse
