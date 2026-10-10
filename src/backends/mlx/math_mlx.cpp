@@ -9,6 +9,12 @@
 #include <metal_linalg/qr.h>
 #include <metal_linalg/eigh.h>
 #include <metal_linalg/svd.h>
+#include <metal_linalg/cholesky.h>
+#include <metal_linalg/lu.h>
+#include <metal_linalg/triangular.h>
+#include <metal_linalg/device.h>
+#include <cmath>
+#include <stdexcept>
 #include <thread>
 #include <vector>
 
@@ -349,60 +355,118 @@ namespace isomorphism::math {
     // 5. HEAVY LINEAR ALGEBRA
     // ==============================================================================
 
-    static mlx::core::array custom_gpu_solve_impl(const mlx::core::array& a, const mlx::core::array& b,
-                                                 int max_iters, float tol) {
-        // 1. Dynamic Norm and Omega Calculation
-        mlx::core::array abs_a = mlx::core::abs(a);
-        mlx::core::array row_sums = mlx::core::sum(abs_a, {-1}, true);
-        mlx::core::array norm_a = mlx::core::max(row_sums, {-2}, true);
+    // The decompositions and solves come from metal-linalg (2.19.0 and later)
+    // in float32, on either device (float16 and bfloat16 are promoted to it
+    // and the results cast back). On the GPU device it sends each shape to
+    // the GPU or to the CPU by its own measured per-device policy; on the CPU
+    // device it keeps to its CPU paths (LAPACK through Accelerate, a batch
+    // over every core), which outrun MLX's own CPU linalg. float64 stays on
+    // MLX's LAPACK, in double.
+    static bool use_metal_linalg(mlx::core::Dtype work) {
+        return work == mlx::core::float32;
+    }
 
-        mlx::core::array epsilon = mlx::core::array(1e-7f, a.dtype());
-        mlx::core::array safe_norm = mlx::core::maximum(norm_a, epsilon);
-        mlx::core::array omega = mlx::core::divide(mlx::core::array(1.0f, a.dtype()), safe_norm);
+    // On the CPU device, metal-linalg's CPU paths alone until the end of the
+    // scope (a thread setting); on the GPU device, its routing as it is.
+    static metal_linalg::CpuOnly device_scope() {
+        return metal_linalg::CpuOnly(metal_linalg::cpu_only() ||
+                                     mlx::core::default_device() == mlx::core::Device::cpu);
+    }
 
-        // 2. Initial State: Compute initial residual before the loop
-        mlx::core::array x = mlx::core::multiply(omega, b);
-        mlx::core::array ax_init = mlx::core::matmul(a, x);
-        mlx::core::array residual = mlx::core::subtract(b, ax_init);
+    // float64 is kept; float16 and bfloat16 are worked in float32 and cast back.
+    static mlx::core::Dtype work_dtype(mlx::core::Dtype t) {
+        return t == mlx::core::float64 ? mlx::core::float64 : mlx::core::float32;
+    }
 
-        const int check_interval = 5;
-
-        for (int i = 0; i < max_iters; i += check_interval) {
-            // 3. Iterative Chunking: Prevents excessive CPU-GPU context switching
-            for (int j = 0; j < check_interval && (i + j) < max_iters; ++j) {
-                // Update rule: X_{k+1} = X_k + omega * residual
-                x = mlx::core::add(x, mlx::core::multiply(omega, residual));
-
-                // Refresh residual for the next step
-                mlx::core::array ax = mlx::core::matmul(a, x);
-                residual = mlx::core::subtract(b, ax);
-            }
-
-            // --- ASYNCHRONOUS CONVERGENCE CHECK ---
-            // Only 'eval' every few steps to maintain GPU throughput
-            mlx::core::array max_err_arr = mlx::core::max(mlx::core::abs(residual));
-            mlx::core::eval({max_err_arr, x});
-
-            if (max_err_arr.item<float>() < tol) {
-                break;
-            }
-        }
-
-        return x;
+    // A [..., n, n] and B as matrices [..., n, k], both broadcast to one batch
+    // shape. B [..., n] is a batch of vectors when it is 1-D or has A's shape
+    // without its last axis (torch.linalg.solve's rule); `vector` says so, and
+    // the result is squeezed back.
+    static std::pair<mlx::core::array, mlx::core::array> batch_rhs(const mlx::core::array &a,
+                                                                   mlx::core::array b, bool &vector,
+                                                                   const char *who) {
+        if (a.ndim() < 2 || a.shape(-1) != a.shape(-2))
+            throw std::invalid_argument(std::string("[isomorphism] ") + who + " needs a [..., n, n] matrix.");
+        vector = b.ndim() == 1 || b.shape() == mlx::core::Shape(a.shape().begin(), a.shape().end() - 1);
+        if (vector) b = mlx::core::expand_dims(b, -1);
+        if (b.ndim() < 2 || b.shape(-2) != a.shape(-1))
+            throw std::invalid_argument(std::string("[isomorphism] ") + who + ": b must be [..., n, k] or [..., n].");
+        mlx::core::Shape sa = mlx::core::broadcast_shapes(mlx::core::Shape(a.shape().begin(), a.shape().end() - 2),
+                                                          mlx::core::Shape(b.shape().begin(), b.shape().end() - 2));
+        mlx::core::Shape sb = sa;
+        sa.insert(sa.end(), {a.shape(-2), a.shape(-1)});
+        sb.insert(sb.end(), {b.shape(-2), b.shape(-1)});
+        return {mlx::core::broadcast_to(a, sa), mlx::core::broadcast_to(b, sb)};
     }
 
     Tensor solve(const Tensor &a, const Tensor &b) {
-        // Check the active execution stream/device.
-        // If running on the GPU, route to the asynchronous, graph-native iterative solver.
-        if (mlx::core::default_device() == mlx::core::Device::gpu) {
-            // 15 iterations is typically sufficient for the strongly diagonally dominant
-            // denominator matrix (V - U) generated in the Padé approximant.
-            return wrap(custom_gpu_solve_impl(unwrap(a), unwrap(b), 15, 1e-5f));
+        const mlx::core::Dtype out = mlx::core::promote_types(unwrap(a).dtype(), unwrap(b).dtype());
+        const mlx::core::Dtype work = work_dtype(out);
+        bool vector = false;
+        auto [A, B] = batch_rhs(mlx::core::astype(unwrap(a), work), mlx::core::astype(unwrap(b), work),
+                                vector, "solve");
+        // LU with partial pivoting either way; metal-linalg's gives NaN for a singular matrix.
+        const auto scope = device_scope();
+        mlx::core::array x = use_metal_linalg(work)
+            ? metal_linalg::solve_accelerated(A, B)
+            : mlx::core::linalg::solve(A, B, mlx::core::Device::cpu);
+        if (vector) x = mlx::core::squeeze(x, -1);
+        return wrap(mlx::core::astype(x, out));
+    }
+
+    Tensor cholesky(const Tensor &a, bool upper) {
+        const mlx::core::Dtype out = unwrap(a).dtype();
+        const mlx::core::Dtype work = work_dtype(out);
+        mlx::core::array A = mlx::core::astype(unwrap(a), work);
+        if (use_metal_linalg(work)) {
+            const auto scope = device_scope();
+            return wrap(mlx::core::astype(metal_linalg::cholesky_accelerated(A, upper), out));
         }
-        // If explicitly running on the CPU, fall back to the native LAPACK implementation.
-        else {
-            return wrap(mlx::core::linalg::solve(unwrap(a), unwrap(b), mlx::core::Device::cpu));
+
+        // float64. MLX's upper factor only: its lower one is LAPACK's potrf with
+        // uplo = 'U', which on macOS 27 (M5 Pro, spotrf at n = 1536) can write
+        // past the end of its own workspace and corrupt the heap. Aᵀ's upper
+        // triangle is A's lower, and L = Uᵀ.
+        mlx::core::array l = upper
+            ? mlx::core::linalg::cholesky(A, true, mlx::core::Device::cpu)
+            : mlx::core::swapaxes(mlx::core::linalg::cholesky(mlx::core::swapaxes(A, -1, -2), true,
+                                                              mlx::core::Device::cpu), -1, -2);
+        // LAPACK's potrf stops at the first pivot that is not positive, and MLX
+        // drops its error. A factor is good iff its diagonal is positive and it
+        // gives back A's diagonal, A_jj = sum_k L_jk^2, to rounding (an unfinished
+        // one does not: its rows from the failure on are left unfactored). A
+        // failed matrix becomes NaN, as on the GPU.
+        const int n = A.shape(-1);
+        const double eps = work == mlx::core::float64 ? 2.220446049250313e-16 : 1.1920928955078125e-7;
+        mlx::core::array d = mlx::core::diagonal(A, 0, -2, -1);
+        mlx::core::array rows = mlx::core::sum(mlx::core::square(l), {upper ? -2 : -1});
+        mlx::core::array ok = mlx::core::logical_and(
+            mlx::core::all(mlx::core::greater(mlx::core::diagonal(l, 0, -2, -1), mlx::core::array(0.0, work)), {-1}, true),
+            mlx::core::all(mlx::core::less_equal(mlx::core::abs(mlx::core::subtract(rows, d)),
+                                                 mlx::core::multiply(mlx::core::array(8.0 * (n + 1) * eps, work), d)),
+                           {-1}, true));
+        l = mlx::core::where(mlx::core::expand_dims(ok, -1), l, mlx::core::array(NAN, work));
+        return wrap(mlx::core::astype(l, out));
+    }
+
+    Tensor solve_triangular(const Tensor &a, const Tensor &b, bool upper, bool unit_diagonal) {
+        const mlx::core::Dtype out = mlx::core::promote_types(unwrap(a).dtype(), unwrap(b).dtype());
+        const mlx::core::Dtype work = work_dtype(out);
+        bool vector = false;
+        auto [A, B] = batch_rhs(mlx::core::astype(unwrap(a), work), mlx::core::astype(unwrap(b), work),
+                                vector, "solve_triangular");
+        mlx::core::array x(0.0f);
+        if (use_metal_linalg(work)) {
+            const auto scope = device_scope();
+            x = metal_linalg::solve_triangular_accelerated(A, B, upper, unit_diagonal);
+        } else {
+            // MLX's own has no unit diagonal: put ones on it.
+            if (unit_diagonal)
+                A = mlx::core::where(mlx::core::eye(A.shape(-1), mlx::core::bool_), mlx::core::array(1.0, work), A);
+            x = mlx::core::linalg::solve_triangular(A, B, upper, mlx::core::Device::cpu);
         }
+        if (vector) x = mlx::core::squeeze(x, -1);
+        return wrap(mlx::core::astype(x, out));
     }
 
     std::tuple<Tensor, Tensor, Tensor> svd(const Tensor &a) {
@@ -417,12 +481,12 @@ namespace isomorphism::math {
 
         // 2. The SVD. metal_linalg returns the thin factors, which for the
         //    square matrices this is used on (projection onto SO(d)) are the
-        //    full ones; it routes each shape to the GPU or the CPU by its own
-        //    measured policy. Non-square input keeps MLX's full-size factors
-        //    on the CPU.
+        //    full ones; see use_metal_linalg for where it runs. Non-square
+        //    input, and float64, keep MLX's full-size factors on the CPU.
         const bool square = arr.ndim() >= 2 && arr.shape(-1) == arr.shape(-2);
         mlx::core::array U(0.0f), S(0.0f), Vt(0.0f);
-        if (square && mlx::core::default_device() == mlx::core::Device::gpu) {
+        if (square && use_metal_linalg(arr.dtype())) {
+            const auto scope = device_scope();
             std::tie(U, S, Vt) = metal_linalg::svd_accelerated(arr);
         } else {
             auto result = mlx::core::linalg::svd(arr, mlx::core::Device::cpu);
@@ -454,10 +518,10 @@ namespace isomorphism::math {
             arr = mlx::core::astype(arr, mlx::core::float32);
         }
 
-        // metal_linalg routes each shape to its GPU Jacobi kernels or to
-        // MLX's CPU eigh by a measured per-device policy; eigenvalues come
-        // back ascending either way.
-        auto [vals, vecs] = mlx::core::default_device() == mlx::core::Device::gpu
+        // metal_linalg in float32 (see use_metal_linalg), MLX's LAPACK in
+        // float64; eigenvalues come back ascending either way.
+        const auto scope = device_scope();
+        auto [vals, vecs] = use_metal_linalg(arr.dtype())
             ? metal_linalg::eigh_accelerated(arr, "L")
             : mlx::core::linalg::eigh(arr, "L", mlx::core::Device::cpu);
 
@@ -470,12 +534,13 @@ namespace isomorphism::math {
     }
 
     std::tuple<Tensor, Tensor> qr(const Tensor &a) {
-        if (mlx::core::default_device() == mlx::core::Device::gpu) {
-            auto [q, r] = metal_linalg::qr_accelerated(unwrap(a));
-            return {wrap(q), wrap(r)};
-        }
-        auto [q, r] = mlx::core::linalg::qr(unwrap(a), mlx::core::Device::cpu);
-        return {wrap(q), wrap(r)};
+        const mlx::core::Dtype out = unwrap(a).dtype();
+        const mlx::core::Dtype work = work_dtype(out);
+        mlx::core::array A = mlx::core::astype(unwrap(a), work);
+        const auto scope = device_scope();
+        auto [q, r] = use_metal_linalg(work) ? metal_linalg::qr_accelerated(A)
+                                             : mlx::core::linalg::qr(A, mlx::core::Device::cpu);
+        return {wrap(mlx::core::astype(q, out)), wrap(mlx::core::astype(r, out))};
     }
 
     Tensor eigvalsh(const Tensor &a) {
@@ -487,7 +552,8 @@ namespace isomorphism::math {
                            orig_dtype == mlx::core::bfloat16);
         if (needs_cast)
             arr = mlx::core::astype(arr, mlx::core::float32);
-        mlx::core::array vals = mlx::core::default_device() == mlx::core::Device::gpu
+        const auto scope = device_scope();
+        mlx::core::array vals = use_metal_linalg(arr.dtype())
             ? metal_linalg::eigvalsh_accelerated(arr, "L")
             : mlx::core::linalg::eigvalsh(arr, "L", mlx::core::Device::cpu);
 
@@ -504,6 +570,38 @@ namespace isomorphism::math {
     // ==============================================================================
     Tensor det(const Tensor &a) {
         mlx::core::array arr = unwrap(a);
+
+        // From metal-linalg's P A = L U (see use_metal_linalg): det A =
+        // (-1)^(row swaps + negative pivots) * exp(sum log|u_ii|), in one pass
+        // over its diagonals and pivots on the host, in double so that no
+        // product overflows on the way; zero for a singular matrix. float64
+        // keeps the elimination in double below.
+        if (arr.ndim() >= 2 && arr.shape(-1) == arr.shape(-2) && arr.shape(-1) > 0
+            && use_metal_linalg(work_dtype(arr.dtype()))) {
+            const metal_linalg::LuResult f = [&] {
+                const auto scope = device_scope();
+                return metal_linalg::lu_factor_ex_accelerated(arr);
+            }();
+            mlx::core::eval({f.lu, f.pivots, f.info});
+            const size_t n = (size_t)arr.shape(-1), batch = f.info.size();
+            const float* lu = f.lu.data<float>();
+            const uint32_t* pivots = f.pivots.data<uint32_t>();
+            const uint32_t* info = f.info.data<uint32_t>();
+            std::vector<float> dets(batch);
+            for (size_t b = 0; b < batch; ++b) {
+                double log_abs = 0.0;
+                unsigned flips = 0;
+                for (size_t i = 0; i < n; ++i) {
+                    const double u = lu[(b * n + i) * n + i];
+                    log_abs += std::log(std::abs(u));
+                    flips += (u < 0) + (pivots[b * n + i] != i);
+                }
+                const double m = std::exp(log_abs);
+                dets[b] = info[b] ? 0.0f : (float)(flips % 2 ? -m : m);
+            }
+            const mlx::core::Shape batch_shape(arr.shape().begin(), arr.shape().end() - 2);
+            return wrap(mlx::core::astype(mlx::core::array(dets.begin(), batch_shape, mlx::core::float32), arr.dtype()));
+        }
 
         // Safety: Force contiguity before reading raw pointer
         arr = mlx::core::multiply(arr, mlx::core::array(1.0f, arr.dtype()));
@@ -617,8 +715,15 @@ namespace isomorphism::math {
     }
 
     Tensor inv(const Tensor &a) {
-        // MLX performs matrix inversion on the CPU via its linalg extension
-        return wrap(mlx::core::linalg::inv(unwrap(a), mlx::core::Device::cpu)); //
+        const mlx::core::Dtype out = unwrap(a).dtype();
+        const mlx::core::Dtype work = work_dtype(out);
+        mlx::core::array A = mlx::core::astype(unwrap(a), work);
+        // metal-linalg's gives NaN for a singular matrix; MLX's own throws.
+        const auto scope = device_scope();
+        mlx::core::array x = use_metal_linalg(work)
+            ? metal_linalg::inv_accelerated(A)
+            : mlx::core::linalg::inv(A, mlx::core::Device::cpu);
+        return wrap(mlx::core::astype(x, out));
     }
 
     // ==============================================================================
@@ -1065,11 +1170,13 @@ namespace isomorphism::math {
 
         // 2. Eigendecomposition of S (symmetric)
         // eigh returns [..., d] vals and [..., d, d] vecs.  Routed exactly as math::eigh
-        // is: on the GPU device metal_linalg picks its Jacobi kernels or MLX's CPU eigh by
-        // its measured per-shape policy, so a batch of particles gets the GPU and a lone
-        // consensus matrix still gets LAPACK.  G = V g(Λ) Vᵀ below is a function of S, so
-        // it does not depend on how either path orders or signs the eigenvectors.
-        auto [vals, vecs] = mlx::core::default_device() == mlx::core::Device::gpu
+        // is: metal_linalg below float64, which on the GPU device picks its Jacobi kernels
+        // or its CPU path by its measured per-shape policy (a batch of particles gets the
+        // GPU and a lone consensus matrix still gets LAPACK) and on the CPU device keeps to
+        // its CPU path.  G = V g(Λ) Vᵀ below is a function of S, so it does not depend on
+        // how either path orders or signs the eigenvectors.
+        const auto scope = device_scope();
+        auto [vals, vecs] = S.dtype() != mlx::core::float64
             ? metal_linalg::eigh_accelerated(S, "L")
             : mlx::core::linalg::eigh(S, "L", mlx::core::Device::cpu);
         // metal_linalg returns float32 whatever it was given.

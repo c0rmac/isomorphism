@@ -19,11 +19,15 @@ brew trust c0rmac/isomorphism          # Homebrew 7 and later ask this of any th
 ```bash
 brew install isomorphism-mlx
 ```
-`qr`, `eigh` and `svd` run on the GPU through
-[metal-linalg](https://github.com/c0rmac/metal-linalg)
-(`c0rmac/metal-linalg/metal-linalg`, pulled in as a dependency), which routes
-each shape to its Metal kernels or to the CPU by a policy measured per device.
-Its tap has to be trusted too: `brew trust c0rmac/metal-linalg`.
+`qr`, `eigh`, `svd`, `cholesky`, `solve`, `inv`, `det` and
+`solve_triangular` come from
+[metal-linalg](https://github.com/c0rmac/metal-linalg) (2.19 or later)
+(`c0rmac/metal-linalg/metal-linalg`, pulled in as a dependency): on the GPU
+device it routes each shape to its Metal kernels or to the CPU by a policy
+measured per device, and on the CPU device it keeps to its CPU paths (LAPACK
+through Accelerate, a batch over every core), which outrun MLX's own CPU
+linear algebra (see [Linear algebra speed](#linear-algebra-speed)). Its tap
+has to be trusted too: `brew trust c0rmac/metal-linalg`.
 
 **Eigen** — lightweight CPU-only, no large framework dependency:
 ```bash
@@ -34,6 +38,9 @@ brew install isomorphism-eigen
 ```bash
 brew install isomorphism-torch
 ```
+On Apple Silicon the same decompositions and solves of CPU and MPS tensors
+come from metal-linalg as above, MPS tensors used in place; float64 and CUDA
+tensors keep torch's own (see [Linear algebra speed](#linear-algebra-speed)).
 
 ---
 
@@ -50,13 +57,14 @@ cmake --install build
 **MLX backend** — needs `mlx` (`brew install mlx`; pass
 `-DCMAKE_PREFIX_PATH=/opt/homebrew` if CMake does not find it) and
 [metal-linalg](https://github.com/c0rmac/metal-linalg), which needs no separate
-install step. CMake takes the first of:
+install step (the Torch backend on Apple Silicon uses it too, built without
+MLX). CMake takes the first of:
 
 1. `-DMETAL_LINALG_SOURCE_DIR=/path/to/metal-linalg`, built in from source;
-2. a metal-linalg checkout in the same parent folder as this project
-   (`../metal-linalg`), built in from source, so that its shaders and
-   per-device routing tables are the checkout's;
-3. an installed metal-linalg, e.g. from Homebrew
+2. a metal-linalg checkout (2.19 or later) in the same parent folder as
+   this project (`../metal-linalg`), built in from source, so that its
+   shaders and per-device routing tables are the checkout's;
+3. an installed metal-linalg 2.19 or later, e.g. from Homebrew
    (`brew tap c0rmac/metal-linalg`, `brew trust c0rmac/metal-linalg`, then
    `brew install metal-linalg`);
 4. otherwise metal-linalg is downloaded from GitHub (`METAL_LINALG_GIT_REPOSITORY`
@@ -64,7 +72,8 @@ install step. CMake takes the first of:
 
 The configure step says which it used (`Isomorphism: metal-linalg from ...`).
 `-DMETAL_LINALG_USE_INSTALLED=ON` insists on an installed copy, which is what
-the `isomorphism-mlx` formula does, since a Homebrew build has no network.
+the `isomorphism-mlx` and `isomorphism-torch` formulas do, since a Homebrew
+build has no network.
 
 **PyTorch backend** — point CMake at your LibTorch installation:
 ```bash
@@ -74,6 +83,8 @@ cmake -S . -B build \
   -DCMAKE_BUILD_TYPE=Release
 ```
 On macOS with Homebrew, `abseil` must also be installed (`brew install abseil`) so that LibTorch's protobuf dependency resolves correctly.
+On Apple Silicon it finds or builds metal-linalg as the MLX backend does;
+`-DISOMORPHISM_TORCH_METAL_LINALG=OFF` leaves everything to torch.
 
 ---
 
@@ -146,7 +157,9 @@ math::gather(a, indices, axis)
 ### Linear algebra
 ```cpp
 math::matmul(a, b)                    // batched matrix multiply
-math::solve(A, b)                     // AX = B
+math::solve(A, b)                     // AX = B (LU); b [..., n, k] or [..., n]
+math::cholesky(A)                     // A = L Lᵀ; cholesky(A, true): A = Uᵀ U
+math::solve_triangular(L, b)          // L X = B; (U, b, true) for upper, unit_diagonal 4th
 auto [U, S, Vh] = math::svd(a)        // singular value decomposition
 auto [Q, R]     = math::qr(a)         // QR decomposition
 math::inv(a)                          // matrix inverse
@@ -296,6 +309,31 @@ auto out_map = iso_eigen::to_matrix_map(result);   // Eigen::Map<MatrixXf>
 // Or copy into a new MatrixXf
 Eigen::MatrixXf out = iso_eigen::to_matrix(result);
 ```
+
+---
+
+## Linear algebra speed
+
+What metal-linalg brings, against each backend's own linear algebra,
+float32, median ms (before → after), on an M5 Pro (`set_default_device_cpu()` / `_gpu()`):
+
+| | MLX, CPU device | Torch, CPU tensors | Torch, MPS tensors |
+|---|---|---|---|
+| cholesky, 4096 × 32×32 | 5.5 → 0.28 | 2.0 → 0.23 | 2.0 → 0.48 |
+| cholesky, one 2048×2048 | 18 → 2.8 | 14 → 2.7 | 5.7 → 3.6 |
+| solve, one 2048×2048, 64 right-hand sides | 41 → 7.4 | 12 → 7.2 | 34 → 5.4 |
+| solve, 4096 × 8×8 | 3.1 → 0.16 | 0.50 → 0.13 | 970 → 0.30 |
+| inv, 1024 × 64×64 | 19 → 2.0 | 5.9 → 2.0 | 794 → 2.5 |
+| det, 4096 × 8×8 | 0.34 → 0.22 | 0.34 → 0.20 | 886 → 0.34 |
+| solve_triangular, 2048, 1024 right-hand sides | 8.3 → 3.2 | 7.6 → 3.2 | 5.8 → 1.8 |
+| svd, 1024 × 16×16 | 16 → 1.3 | 16 → 1.3 | 19 → 0.96 |
+| eigh, 1024 × 32×32 | 33 → 2.3 | 32 → 2.3 | 36 → 1.5 |
+| qr, 1024 × 64×64 | 28 → 2.7 | 25 → 2.7 | 32 → 1.6 |
+
+Torch is conda-forge's 2.13 with its CPU LAPACK from Accelerate, as pip's
+wheels have it (with OpenBLAS instead, the CPU column's left side is up to
+9x slower). On the MLX backend's GPU device these calls were metal-linalg's
+already, and are unchanged.
 
 ---
 

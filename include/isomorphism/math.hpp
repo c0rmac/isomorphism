@@ -231,11 +231,42 @@ namespace isomorphism::math {
     // ==============================================================================
     // 5. HEAVY LINEAR ALGEBRA
     // ==============================================================================
+    //
+    // On Apple Silicon, solve, inv, det, cholesky, solve_triangular, qr, eigh,
+    // eigvalsh and (square) svd come from metal-linalg in float32 -- the MLX
+    // backend's arrays, and the Torch backend's CPU and MPS tensors: on the CPU
+    // device its CPU paths (LAPACK through Accelerate, a batch over every
+    // core), on the GPU device wherever its measured per-device policy sends
+    // the shape, the GPU or the CPU. float64 stays with the backend's own LAPACK.
 
     /** * @brief Solves the linear system AX = B for X.
      * Heavily utilized in the Cayley Transform to avoid matrix inversion.
+     *
+     * A is [..., n, n]; B is [..., n, k], or a batch of vectors [..., n] when
+     * it is 1-D or has A's shape without its last axis (as torch.linalg.solve).
+     * The batch axes broadcast. LU with partial pivoting; metal-linalg's (see
+     * above) gives NaN for a singular A.
      */
     Tensor solve(const Tensor &a, const Tensor &b);
+
+    /** * @brief Batched Cholesky factorization of symmetric positive definite matrices.
+     * Returns L [..., n, n], lower triangular with a positive diagonal, such that
+     * A = L Lᵀ; with upper = true, U = Lᵀ, so that A = Uᵀ U. Only the lower
+     * triangle of A is read (the upper with upper = true) and the other triangle
+     * of the result is zero. A matrix that is not positive definite gives an
+     * all-NaN result for that matrix alone.
+     */
+    Tensor cholesky(const Tensor &a, bool upper = false);
+
+    /** * @brief Solves A X = B for X with A triangular.
+     * A is [..., n, n]; only its lower triangle is read (the upper with
+     * upper = true), and with unit_diagonal its diagonal is taken as ones and
+     * not read. B is [..., n, k] or [..., n], as for solve, and the batch axes
+     * broadcast. With L = cholesky(A), A x = b is solved by
+     * x = solve_triangular(Lᵀ, solve_triangular(L, b), true).
+     */
+    Tensor solve_triangular(const Tensor &a, const Tensor &b, bool upper = false,
+                            bool unit_diagonal = false);
 
     /** * @brief Batched Singular Value Decomposition (SVD).
      * @return A tuple of 3 tensors: {U, S, V_transpose}.
@@ -343,11 +374,14 @@ namespace isomorphism::math {
     Tensor eigvalsh(const Tensor &a);
 
     /** * @brief Computes the determinant of a square matrix or a batch of square matrices.
+     * From an LU factorization (metal-linalg's, see above).
      * @return A tensor containing the determinant(s).
      */
     Tensor det(const Tensor &a);
 
-    /** @brief Computes the explicit matrix inverse. Prefer 'solve' for systems of equations. */
+    /** @brief Computes the explicit matrix inverse. Prefer 'solve' for systems of equations.
+     * metal-linalg's (see above) gives NaN for a singular matrix.
+     */
     Tensor inv(const Tensor &a);
 
     /** @brief Computes the sum of diagonal elements (the trace) of a matrix. */

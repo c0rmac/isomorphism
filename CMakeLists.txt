@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.25)
-project(isomorphism VERSION 1.1.1 LANGUAGES CXX)
+project(isomorphism VERSION 1.2.0 LANGUAGES CXX)
 
 # ==============================================================================
 # 1. Global C++ Standards & Project Configuration
@@ -93,29 +93,41 @@ macro(isomorphism_add_backend _name _define)
 endmacro()
 
 # ==============================================================================
-# 3. Backend Targets
+# 3. metal-linalg (Apple Silicon: the MLX backend, and the Torch backend's CPU
+#    and MPS tensors)
 # ==============================================================================
+# The decompositions and solves -- QR, eigh, the SVD, Cholesky, LU (solve, inv,
+# det) and the triangular solve -- come from metal-linalg 2.19 or later
+# (https://github.com/c0rmac/metal-linalg), on the GPU or on its CPU paths.
+# Nothing has to be installed by hand: CMake takes the first of
+#
+#   1. METAL_LINALG_SOURCE_DIR, if set: that checkout, built in from source;
+#   2. a checkout beside this project (../metal-linalg) that is 2.19 or
+#      later, likewise;
+#   3. an installed metal-linalg 2.19 or later, e.g. from Homebrew;
+#   4. otherwise metal-linalg is downloaded from METAL_LINALG_GIT_REPOSITORY
+#      and built along with this project, automatically.
+#
+# Built in from source (1, 2, 4) it is a static library folded into the
+# backend's library, and its shaders and per-device routing tables are the
+# checkout's; for the Torch backend alone it is built without MLX (its C API
+# on float buffers). -DMETAL_LINALG_USE_INSTALLED=ON insists on 3, which is
+# what the Homebrew formulas do, since a Homebrew build has no network. Either
+# way the library carries its own compiled shaders.
+set(ISOMORPHISM_METAL_LINALG_MIN 2.19)
 
-# --- Apple Silicon / MLX ---
-if (USE_MLX)
-    message(STATUS "Isomorphism: Building MLX backend (Apple Silicon)")
-    find_package(MLX REQUIRED)
+# The version a metal-linalg checkout's CMakeLists.txt declares, or "".
+function(_iso_metal_linalg_checkout_version dir out)
+    set(_v "")
+    if (EXISTS "${dir}/CMakeLists.txt")
+        file(STRINGS "${dir}/CMakeLists.txt" _line REGEX "project\\(metal_linalg VERSION [0-9]+\\.[0-9]+" LIMIT_COUNT 1)
+        string(REGEX MATCH "[0-9]+\\.[0-9]+(\\.[0-9]+)?" _v "${_line}")
+    endif ()
+    set(${out} "${_v}" PARENT_SCOPE)
+endfunction()
 
-    # QR, eigh and SVD on the GPU come from metal-linalg
-    # (https://github.com/c0rmac/metal-linalg). Nothing has to be installed by
-    # hand: CMake takes the first of
-    #
-    #   1. METAL_LINALG_SOURCE_DIR, if set: that checkout, built in from source;
-    #   2. a checkout beside this project (../metal-linalg), likewise;
-    #   3. an installed metal-linalg, e.g. from Homebrew;
-    #   4. otherwise metal-linalg is downloaded from METAL_LINALG_GIT_REPOSITORY
-    #      and built along with this project, automatically.
-    #
-    # Built in from source (1, 2, 4) it is a static library folded into
-    # libisomorphism_mlx, and its shaders and per-device routing tables are the
-    # checkout's. -DMETAL_LINALG_USE_INSTALLED=ON insists on 3, which is what
-    # the isomorphism-mlx formula does, since a Homebrew build has no network.
-    # Either way the library carries its own compiled shaders.
+# Finds or builds metal-linalg as above, with its MLX API or without it.
+macro(isomorphism_use_metal_linalg _with_mlx)
     option(METAL_LINALG_USE_INSTALLED
            "Use only an installed metal-linalg (find_package), never a source checkout or a download" OFF)
     set(METAL_LINALG_SOURCE_DIR "" CACHE PATH
@@ -123,23 +135,33 @@ if (USE_MLX)
     set(METAL_LINALG_GIT_REPOSITORY "https://github.com/c0rmac/metal-linalg.git" CACHE STRING
         "Where to download metal-linalg from when no checkout or installed copy is found")
     set(METAL_LINALG_GIT_TAG "main" CACHE STRING "Git tag or branch of metal-linalg to download")
+    # Read by metal-linalg's own option() when it is built in (policy CMP0077)
+    set(METAL_LINALG_WITH_MLX ${_with_mlx})
 
     set(_iso_metal_linalg_installed OFF)
     if (METAL_LINALG_USE_INSTALLED)
-        find_package(MetalLinalg REQUIRED)
+        find_package(MetalLinalg ${ISOMORPHISM_METAL_LINALG_MIN} REQUIRED)
         set(_iso_metal_linalg_installed ON)
         set(_iso_metal_linalg_from "the installed package (${MetalLinalg_DIR})")
     else ()
-        if (NOT METAL_LINALG_SOURCE_DIR
-            AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/../metal-linalg/include/metal_linalg/qr.h")
-            get_filename_component(METAL_LINALG_SOURCE_DIR
-                                   "${CMAKE_CURRENT_SOURCE_DIR}/../metal-linalg" ABSOLUTE)
+        if (METAL_LINALG_SOURCE_DIR)
+            _iso_metal_linalg_checkout_version("${METAL_LINALG_SOURCE_DIR}" _iso_ml_version)
+            if (NOT _iso_ml_version OR _iso_ml_version VERSION_LESS ISOMORPHISM_METAL_LINALG_MIN)
+                message(FATAL_ERROR "Isomorphism: METAL_LINALG_SOURCE_DIR (${METAL_LINALG_SOURCE_DIR}) is "
+                                    "metal-linalg '${_iso_ml_version}'; ${ISOMORPHISM_METAL_LINALG_MIN} or later is needed.")
+            endif ()
+        else ()
+            _iso_metal_linalg_checkout_version("${CMAKE_CURRENT_SOURCE_DIR}/../metal-linalg" _iso_ml_version)
+            if (_iso_ml_version AND NOT _iso_ml_version VERSION_LESS ISOMORPHISM_METAL_LINALG_MIN)
+                get_filename_component(METAL_LINALG_SOURCE_DIR
+                                       "${CMAKE_CURRENT_SOURCE_DIR}/../metal-linalg" ABSOLUTE)
+            endif ()
         endif ()
         if (METAL_LINALG_SOURCE_DIR)
             add_subdirectory("${METAL_LINALG_SOURCE_DIR}" "${CMAKE_CURRENT_BINARY_DIR}/metal-linalg")
-            set(_iso_metal_linalg_from "source at ${METAL_LINALG_SOURCE_DIR}")
+            set(_iso_metal_linalg_from "source at ${METAL_LINALG_SOURCE_DIR} (${_iso_ml_version})")
         else ()
-            find_package(MetalLinalg CONFIG QUIET)
+            find_package(MetalLinalg ${ISOMORPHISM_METAL_LINALG_MIN} CONFIG QUIET)
             if (MetalLinalg_FOUND)
                 set(_iso_metal_linalg_installed ON)
                 set(_iso_metal_linalg_from "the installed package (${MetalLinalg_DIR})")
@@ -163,6 +185,33 @@ if (USE_MLX)
         install(TARGETS metal_linalg EXPORT IsomorphismTargets
                 ARCHIVE DESTINATION lib LIBRARY DESTINATION lib)
     endif ()
+endmacro()
+
+# The Torch backend uses metal-linalg for CPU and MPS tensors on Apple Silicon.
+if (APPLE AND CMAKE_SYSTEM_PROCESSOR MATCHES "arm64|aarch64")
+    option(ISOMORPHISM_TORCH_METAL_LINALG
+           "Torch backend: decompositions and solves of CPU and MPS tensors through metal-linalg" ON)
+else ()
+    set(ISOMORPHISM_TORCH_METAL_LINALG OFF)
+endif ()
+set(_iso_metal_linalg OFF)
+if (USE_MLX OR (USE_TORCH AND ISOMORPHISM_TORCH_METAL_LINALG))
+    if (USE_MLX)
+        isomorphism_use_metal_linalg(ON)
+    else ()
+        isomorphism_use_metal_linalg(OFF)
+    endif ()
+    set(_iso_metal_linalg ON)
+endif ()
+
+# ==============================================================================
+# 4. Backend Targets
+# ==============================================================================
+
+# --- Apple Silicon / MLX ---
+if (USE_MLX)
+    message(STATUS "Isomorphism: Building MLX backend (Apple Silicon)")
+    find_package(MLX REQUIRED)
 
     isomorphism_add_backend(mlx USE_MLX
         src/backends/mlx/tensor_mlx.cpp
@@ -217,6 +266,10 @@ if (USE_TORCH)
     )
     target_include_directories(isomorphism_torch SYSTEM PRIVATE "${TORCH_INCLUDE_DIRS}")
     target_link_libraries(isomorphism_torch PRIVATE "${TORCH_LIBRARIES}")
+    if (ISOMORPHISM_TORCH_METAL_LINALG)
+        target_link_libraries(isomorphism_torch PRIVATE metal_linalg::metal_linalg)
+        target_compile_definitions(isomorphism_torch PRIVATE ISOMORPHISM_HAS_METAL_LINALG)
+    endif ()
     if (TORCH_CXX_FLAGS)
         target_compile_options(isomorphism_torch PRIVATE ${TORCH_CXX_FLAGS})
     endif ()
@@ -236,14 +289,14 @@ if (USE_SYCL)
 endif ()
 
 # ==============================================================================
-# 4. Build-Tree Default Alias
+# 5. Build-Tree Default Alias
 # ==============================================================================
 # Plain "isomorphism" target used by tests/add_subdirectory consumers.
 # Points to the first registered backend (MLX > Eigen > Torch > SYCL).
 add_library(isomorphism ALIAS isomorphism_${_iso_default_backend})
 
 # ==============================================================================
-# 5. Installation & Export
+# 6. Installation & Export
 # ==============================================================================
 
 # Public headers (include/) are shared by all backends — install once.
@@ -297,8 +350,8 @@ include("${CMAKE_CURRENT_LIST_DIR}/IsomorphismTargets.cmake")
 ]=])
 file(APPEND "${CMAKE_CURRENT_BINARY_DIR}/isomorphismConfig.cmake"
     "set(isomorphism_DEFAULT_TARGET isomorphism::${_iso_default_backend})\n")
-if (USE_MLX AND _iso_metal_linalg_installed)
-    # isomorphism_mlx links the installed metal-linalg, so a consumer of this
+if (_iso_metal_linalg AND _iso_metal_linalg_installed)
+    # The backends link the installed metal-linalg, so a consumer of this
     # installation needs it found too (a static build references its target).
     file(APPEND "${CMAKE_CURRENT_BINARY_DIR}/isomorphismConfig.cmake"
         "include(CMakeFindDependencyMacro)\nfind_dependency(MetalLinalg)\n")
@@ -309,7 +362,7 @@ install(FILES "${CMAKE_CURRENT_BINARY_DIR}/isomorphismConfig.cmake"
 )
 
 # ==============================================================================
-# 6. Tests
+# 7. Tests
 # ==============================================================================
 if (BUILD_TESTING)
     enable_testing()
