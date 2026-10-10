@@ -4,8 +4,20 @@
 #include "tensor_impl_torch.hpp"
 #include <torch/torch.h>
 
+#include <cmath>
+#include <cstdint>
+#include <functional>
 #include <limits>
+#include <mutex>
+#include <stdexcept>
+#include <string>
 #include <vector>
+
+#ifdef ISOMORPHISM_HAS_METAL_LINALG
+#include <metal_linalg/c_api.h>
+#include <metal_linalg/device.h>
+#include <torch/mps.h>
+#endif
 
 namespace isomorphism::math {
 
@@ -270,18 +282,213 @@ namespace isomorphism::math {
         return {a.expand(sa).contiguous(), b.expand(sb).contiguous()};
     }
 
-    // LU with partial pivoting on every device (torch.linalg.solve, MPS included
-    // since torch 2.x).
+
+#ifdef ISOMORPHISM_HAS_METAL_LINALG
+    // ==============================================================================
+    // metal-linalg (Apple Silicon)
+    // ==============================================================================
+    // The decompositions and solves of CPU and MPS tensors go to metal-linalg,
+    // in float32 (float16 and bfloat16 promoted, the results cast back): a CPU
+    // tensor on its CPU paths alone (LAPACK through Accelerate, a batch over
+    // every core, which outrun torch's), an MPS tensor wherever its measured
+    // per-device policy sends that shape, the GPU or the CPU. float64, CUDA and
+    // empty tensors stay with torch.
+    static bool ml_takes(const torch::Tensor& t) {
+        return (t.is_cpu() || t.is_mps()) && t.is_floating_point() && t.scalar_type() != torch::kFloat64 &&
+               t.dim() >= 2 && t.numel() > 0;
+    }
+
+    // A contiguous MPS tensor's memory as a CPU address, or nullptr where
+    // metal-linalg cannot use it in place (not a Metal buffer in shared
+    // storage). An MPS storage's data pointer is its id<MTLBuffer>.
+    static void* mps_address(const torch::Tensor& t) {
+        return metal_linalg_buffer_contents(t.storage().data(), (uint64_t)t.storage_offset() * t.element_size(),
+                                            (uint64_t)t.numel() * t.element_size());
+    }
+
+    // Whether MPS tensors are in memory metal-linalg can read and write in
+    // place: a CPU read of what MPS wrote, and an MPS read of a CPU write.
+    // Probed once; where not, MPS tensors are copied to the CPU and back.
+    static bool mps_in_place() {
+        static const bool ok = [] {
+            try {
+                auto t = torch::arange(1, 65, torch::TensorOptions().dtype(torch::kFloat32).device(torch::kMPS)) * 2;
+                torch::mps::synchronize();
+                auto* p = static_cast<float*>(mps_address(t));
+                if (!p) return false;
+                for (int i = 0; i < 64; ++i)
+                    if (p[i] != 2.0f * (i + 1)) return false;
+                p[0] = -1.0f;
+                return t[0].item<float>() == -1.0f;
+            } catch (const std::exception&) {
+                return false;
+            }
+        }();
+        return ok;
+    }
+
+    // [..., m, n] as (batch, m, n), each below 2^32.
+    struct MlDims {
+        std::vector<int64_t> lead;
+        uint32_t batch, m, n;
+    };
+    static MlDims ml_dims(const torch::Tensor& t) {
+        MlDims d{std::vector<int64_t>(t.sizes().begin(), t.sizes().end() - 2), 1, (uint32_t)t.size(-2),
+                 (uint32_t)t.size(-1)};
+        int64_t batch = 1;
+        for (int64_t e : d.lead) batch *= e;
+        if (batch > UINT32_MAX || t.size(-2) > UINT32_MAX || t.size(-1) > UINT32_MAX)
+            throw std::invalid_argument("[isomorphism/torch] metal-linalg takes a batch, rows and columns below 2^32");
+        d.batch = (uint32_t)batch;
+        return d;
+    }
+    static std::vector<int64_t> with_tail(std::vector<int64_t> lead, std::initializer_list<int64_t> tail) {
+        lead.insert(lead.end(), tail);
+        return lead;
+    }
+
+    struct MlOut {
+        std::vector<int64_t> shape;
+        torch::ScalarType dtype = torch::kFloat32;
+    };
+    using MlCall = std::function<metal_linalg_status(const std::vector<const float*>&, const std::vector<void*>&)>;
+
+    // metal-linalg's GPU workspaces are not thread-safe: one GPU-routed call at a time.
+    static std::mutex& ml_gpu_mutex() {
+        static std::mutex m;
+        return m;
+    }
+
+    static void ml_check(metal_linalg_status s) {
+        if (s != METAL_LINALG_OK)
+            throw std::runtime_error(std::string("[isomorphism/torch] metal-linalg: ") + metal_linalg_last_error());
+    }
+
+    // Runs call(input addresses, output addresses) on float32 contiguous forms
+    // of `in` (all on one device) into new outputs of `outs` on that device.
+    static std::vector<torch::Tensor> ml_run(const std::vector<torch::Tensor>& in, const std::vector<MlOut>& outs,
+                                             const MlCall& call) {
+        const torch::Device device = in[0].device();
+        std::vector<torch::Tensor> x, y;
+        for (const auto& t : in) x.push_back(t.detach().to(torch::kFloat32).contiguous());
+        auto alloc = [&](torch::Device d) {
+            y.clear();
+            for (const auto& o : outs) y.push_back(torch::empty(o.shape, torch::TensorOptions().dtype(o.dtype).device(d)));
+        };
+        if (device.is_mps() && mps_in_place()) {
+            alloc(device);
+            // MPS's queued work may still be writing the input; metal-linalg
+            // reads and writes from its own queue and from the CPU.
+            torch::mps::synchronize();
+            std::vector<const float*> xa;
+            std::vector<void*> ya;
+            bool all = true;
+            for (auto& t : x) {
+                xa.push_back(static_cast<const float*>(mps_address(t)));
+                all = all && xa.back() != nullptr;
+            }
+            for (auto& t : y) {
+                ya.push_back(mps_address(t));
+                all = all && ya.back() != nullptr;
+            }
+            if (all) {
+                std::lock_guard<std::mutex> lock(ml_gpu_mutex());
+                // The tensors' own Metal buffers, known to metal-linalg for the
+                // call, so that its GPU backends use them rather than wrapping
+                // the memory in new buffers
+                std::vector<std::pair<const void*, const void*>> known;
+                auto know = [&](const torch::Tensor& t, const void* p) {
+                    if (p && t.storage_offset() == 0 && metal_linalg_know_buffer(p, t.storage().data()))
+                        known.emplace_back(p, t.storage().data());
+                };
+                for (size_t i = 0; i < x.size(); ++i) know(x[i], xa[i]);
+                for (size_t i = 0; i < y.size(); ++i) know(y[i], ya[i]);
+                const metal_linalg_status st = call(xa, ya);
+                for (const auto& k : known) metal_linalg_forget_buffer(k.first, k.second);
+                ml_check(st);
+                return y;
+            }
+        }
+        // CPU tensors, on the CPU paths alone; MPS ones copied, routed as on MPS
+        for (auto& t : x) t = t.cpu();
+        alloc(torch::kCPU);
+        std::vector<const float*> xa;
+        std::vector<void*> ya;
+        for (auto& t : x) xa.push_back(t.data_ptr<float>());
+        for (auto& t : y) ya.push_back(t.data_ptr());
+        if (device.is_cpu()) {
+            metal_linalg::CpuOnly cpu;
+            ml_check(call(xa, ya));
+        } else {
+            std::lock_guard<std::mutex> lock(ml_gpu_mutex());
+            ml_check(call(xa, ya));
+        }
+        if (!device.is_cpu())
+            for (auto& t : y) t = t.to(device);
+        return y;
+    }
+
+    // The determinant from a packed LU [n, n] (row-major) and its 0-based
+    // pivots: (-1)^(row swaps + negative pivots) * exp(sum log|u_ii|), in
+    // double so that no product overflows on the way; zero for a singular
+    // matrix (info > 0).
+    static double det_from_lu(const float* lu, const uint32_t* pivots, uint32_t info, uint32_t n) {
+        if (info) return 0.0;
+        double log_abs = 0.0;
+        unsigned flips = 0;
+        for (uint32_t i = 0; i < n; ++i) {
+            const double u = lu[(size_t)i * n + i];
+            log_abs += std::log(std::abs(u));
+            flips += (u < 0) + (pivots[i] != i);
+        }
+        const double m = std::exp(log_abs);
+        return flips % 2 ? -m : m;
+    }
+
+    static torch::Tensor as(const torch::Tensor& t, torch::ScalarType dtype) {
+        return t.scalar_type() == dtype ? t : t.to(dtype);
+    }
+#endif
+
+    // LU with partial pivoting on every device (metal-linalg's, else
+    // torch.linalg.solve, MPS included since torch 2.x).
     Tensor solve(const Tensor& a, const Tensor& b) {
         bool vector = false;
         auto [t_a, t_b] = batch_rhs(unwrap(a), unwrap(b), vector);
-        auto x = linalg_solve_anywhere(t_a, t_b);
+        torch::Tensor x;
+#ifdef ISOMORPHISM_HAS_METAL_LINALG
+        if (ml_takes(t_a) && ml_takes(t_b) && t_a.device() == t_b.device()) {
+            const auto out = torch::promote_types(t_a.scalar_type(), t_b.scalar_type());
+            const MlDims d = ml_dims(t_a);
+            const uint32_t k = (uint32_t)t_b.size(-1);
+            auto r = ml_run({t_a, t_b}, {{t_b.sizes().vec()}, {d.lead, torch::kInt32}},
+                            [&](const auto& in, const auto& o) {
+                                return metal_linalg_solve(in[0], d.batch, d.n, in[1], k, (float*)o[0], (uint32_t*)o[1]);
+                            });
+            x = as(r[0], out);
+        } else
+#endif
+        x = linalg_solve_anywhere(t_a, t_b);
         return wrap(vector ? x.squeeze(-1) : x);
     }
 
     std::tuple<Tensor, Tensor, Tensor> svd(const Tensor& a) {
         auto t = unwrap(a);
         auto original_device = t.device();
+#ifdef ISOMORPHISM_HAS_METAL_LINALG
+        // metal-linalg's thin factors are the full ones for a square matrix;
+        // other shapes keep torch's full factors.
+        if (ml_takes(t) && t.size(-1) == t.size(-2)) {
+            const MlDims d = ml_dims(t);
+            const int64_t n = d.n;
+            auto r = ml_run({t}, {{t.sizes().vec()}, {with_tail(d.lead, {n})}, {t.sizes().vec()}},
+                            [&](const auto& in, const auto& o) {
+                                return metal_linalg_svd(in[0], d.batch, d.m, d.n, (float*)o[0], (float*)o[1],
+                                                        (float*)o[2], nullptr);
+                            });
+            return {wrap(as(r[0], t.scalar_type())), wrap(as(r[1], t.scalar_type())), wrap(as(r[2], t.scalar_type()))};
+        }
+#endif
 
         // Force the operation onto the CPU
         auto [U, S, Vh] = torch::linalg_svd(t.to(torch::kCPU), /*full_matrices=*/true);
@@ -295,6 +502,17 @@ namespace isomorphism::math {
     std::tuple<Tensor, Tensor> qr(const Tensor& a) {
         auto t = unwrap(a);
         auto original_device = t.device();
+#ifdef ISOMORPHISM_HAS_METAL_LINALG
+        if (ml_takes(t)) {
+            const MlDims d = ml_dims(t);
+            const int64_t m = d.m, n = d.n, k = std::min(m, n);
+            auto r = ml_run({t}, {{with_tail(d.lead, {m, k})}, {with_tail(d.lead, {k, n})}},
+                            [&](const auto& in, const auto& o) {
+                                return metal_linalg_qr(in[0], d.batch, d.m, d.n, (float*)o[0], (float*)o[1]);
+                            });
+            return {wrap(as(r[0], t.scalar_type())), wrap(as(r[1], t.scalar_type()))};
+        }
+#endif
 
         // Force the operation onto the CPU
         auto [Q, R] = torch::linalg_qr(t.to(torch::kCPU), "reduced");
@@ -309,6 +527,28 @@ namespace isomorphism::math {
     // and 1536) where its LU of the same matrix is sound.
     Tensor det(const Tensor& a) {
         auto t = unwrap(a);
+#ifdef ISOMORPHISM_HAS_METAL_LINALG
+        // From metal-linalg's P A = L U, in one pass over its diagonals and
+        // pivots once it returns (det_from_lu).
+        if (ml_takes(t) && t.size(-1) == t.size(-2)) {
+            const MlDims d = ml_dims(t);
+            const int64_t n = d.n;
+            auto r = ml_run({t},
+                            {{t.sizes().vec()}, {with_tail(d.lead, {n}), torch::kInt32}, {d.lead, torch::kInt32},
+                             {d.lead}},
+                            [&](const auto& in, const auto& o) {
+                                const metal_linalg_status st = metal_linalg_lu_factor(
+                                    in[0], d.batch, d.n, (float*)o[0], (uint32_t*)o[1], (uint32_t*)o[2]);
+                                if (st == METAL_LINALG_OK)
+                                    for (uint32_t b = 0; b < d.batch; ++b)
+                                        ((float*)o[3])[b] = (float)det_from_lu((const float*)o[0] + (size_t)b * n * n,
+                                                                               (const uint32_t*)o[1] + (size_t)b * n,
+                                                                               ((const uint32_t*)o[2])[b], d.n);
+                                return st;
+                            });
+            return wrap(as(r[3], t.scalar_type()));
+        }
+#endif
         if (!t.is_mps() || t.dim() < 2 || t.size(-1) == 0) return wrap(torch::linalg_det(t));
         // The product as exp(sum log|u_ii|) with the signs counted apart: a
         // float32 product can overflow and underflow on the way to a
@@ -323,12 +563,32 @@ namespace isomorphism::math {
     }
 
     Tensor inv(const Tensor& a) {
-        return wrap(torch::linalg_inv(unwrap(a)));
+        auto t = unwrap(a);
+#ifdef ISOMORPHISM_HAS_METAL_LINALG
+        // metal-linalg's gives NaN for a singular matrix; torch's own throws.
+        if (ml_takes(t) && t.size(-1) == t.size(-2)) {
+            const MlDims d = ml_dims(t);
+            auto r = ml_run({t}, {{t.sizes().vec()}, {d.lead, torch::kInt32}}, [&](const auto& in, const auto& o) {
+                return metal_linalg_inv(in[0], d.batch, d.n, (float*)o[0], (uint32_t*)o[1]);
+            });
+            return wrap(as(r[0], t.scalar_type()));
+        }
+#endif
+        return wrap(torch::linalg_inv(t));
     }
 
     // A matrix that is not positive definite becomes NaN rather than throwing,
     // as on the other backends.
     Tensor cholesky(const Tensor& a, bool upper) {
+#ifdef ISOMORPHISM_HAS_METAL_LINALG
+        if (auto t = unwrap(a); ml_takes(t) && t.size(-1) == t.size(-2)) {
+            const MlDims d = ml_dims(t);
+            auto r = ml_run({t}, {{t.sizes().vec()}}, [&](const auto& in, const auto& o) {
+                return metal_linalg_cholesky(in[0], d.batch, d.n, upper ? 1 : 0, (float*)o[0], nullptr);
+            });
+            return wrap(as(r[0], t.scalar_type()));
+        }
+#endif
         auto [L, info] = torch::linalg_cholesky_ex(unwrap(a), upper);
         auto failed = info.ne(0).unsqueeze(-1).unsqueeze(-1);
         return wrap(torch::where(failed, torch::full({}, std::numeric_limits<double>::quiet_NaN(), L.options()), L));
@@ -338,13 +598,36 @@ namespace isomorphism::math {
     Tensor solve_triangular(const Tensor& a, const Tensor& b, bool upper, bool unit_diagonal) {
         bool vector = false;
         auto [t_a, t_b] = batch_rhs(unwrap(a), unwrap(b), vector);
-        auto x = torch::linalg_solve_triangular(t_a, t_b, upper, /*left=*/true, unit_diagonal);
+        torch::Tensor x;
+#ifdef ISOMORPHISM_HAS_METAL_LINALG
+        if (ml_takes(t_a) && ml_takes(t_b) && t_a.device() == t_b.device()) {
+            const auto out = torch::promote_types(t_a.scalar_type(), t_b.scalar_type());
+            const MlDims d = ml_dims(t_a);
+            const uint32_t k = (uint32_t)t_b.size(-1);
+            auto r = ml_run({t_a, t_b}, {{t_b.sizes().vec()}}, [&](const auto& in, const auto& o) {
+                return metal_linalg_solve_triangular(in[0], d.batch, d.n, in[1], k, upper ? 1 : 0,
+                                                     unit_diagonal ? 1 : 0, (float*)o[0]);
+            });
+            x = as(r[0], out);
+        } else
+#endif
+        x = torch::linalg_solve_triangular(t_a, t_b, upper, /*left=*/true, unit_diagonal);
         return wrap(vector ? x.squeeze(-1) : x);
     }
 
     Tensor eigvalsh(const Tensor& a) {
         auto t = unwrap(a);
         auto original_device = t.device();
+#ifdef ISOMORPHISM_HAS_METAL_LINALG
+        // Ascending, the lower triangle read, as torch's.
+        if (ml_takes(t) && t.size(-1) == t.size(-2)) {
+            const MlDims d = ml_dims(t);
+            auto r = ml_run({t}, {{with_tail(d.lead, {(int64_t)d.n})}}, [&](const auto& in, const auto& o) {
+                return metal_linalg_eigh(in[0], d.batch, d.n, 1, (float*)o[0], nullptr, nullptr);
+            });
+            return wrap(as(r[0], t.scalar_type()));
+        }
+#endif
         // torch::linalg_eigvalsh returns eigenvalues in ascending order.
         auto vals = torch::linalg_eigvalsh(t.to(torch::kCPU), "L");
         return wrap(vals.to(original_device));
@@ -353,6 +636,16 @@ namespace isomorphism::math {
     std::tuple<Tensor, Tensor> eigh(const Tensor& a) {
         auto t = unwrap(a);
         auto original_device = t.device();
+#ifdef ISOMORPHISM_HAS_METAL_LINALG
+        if (ml_takes(t) && t.size(-1) == t.size(-2)) {
+            const MlDims d = ml_dims(t);
+            auto r = ml_run({t}, {{with_tail(d.lead, {(int64_t)d.n})}, {t.sizes().vec()}},
+                            [&](const auto& in, const auto& o) {
+                                return metal_linalg_eigh(in[0], d.batch, d.n, 1, (float*)o[0], (float*)o[1], nullptr);
+                            });
+            return {wrap(as(r[0], t.scalar_type())), wrap(as(r[1], t.scalar_type()))};
+        }
+#endif
         auto [vals, vecs] = torch::linalg_eigh(t.to(torch::kCPU), "L");
         return {wrap(vals.to(original_device)), wrap(vecs.to(original_device))};
     }
